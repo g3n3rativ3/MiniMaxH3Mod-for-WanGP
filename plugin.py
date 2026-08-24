@@ -38,7 +38,8 @@ from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, storage
 from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
-                      install_get_model_settings_patch, install_prepare_inputs_dict_patch)
+                      install_get_model_settings_patch, install_prepare_inputs_dict_patch,
+                      is_minimax_h3_ref2va)
 
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
@@ -258,7 +259,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.23.0"
+        self.version = "0.24.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -273,6 +274,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         self.request_global("prepare_inputs_dict")
         self.request_global("get_state_model_type")
         self.request_global("get_model_settings")
+        self.request_global("get_base_model_type")
         self.add_tab(tab_id=PlugIn_Id, label=PlugIn_Name, component_constructor=self.create_ui)
         self.insert_after(target_component_id="loras_multipliers",
                           new_component_constructor=self._build_inline_refmods_section)
@@ -310,10 +312,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                  "RefMods will likely not take effect until Wan2GP is restarted after this "
                  "plugin was enabled. Use 'Check setup for this model' in the plugin tab to confirm.")
 
+        get_base_mt = getattr(self, "get_base_model_type", None)
+        if not callable(get_base_mt):
+            print("[H3RefMod] get_base_model_type was not exposed by Wan2GP's plugin globals; "
+                 "a MiniMax H3 Ref2VA finetune whose own model_type name doesn't start with "
+                 "'minimax_h3_ref2va' (e.g. a custom-named checkpoint) may not be recognized -- "
+                 "the inline panel would stay hidden for it, and RefMods wouldn't apply even if "
+                 "selected through the plugin's own 'Generate' tab.")
+            get_base_mt = None
+
         orig_prepare = getattr(self, "prepare_inputs_dict", None)
         get_state_mt = getattr(self, "get_state_model_type", None)
         if callable(orig_prepare) and callable(get_state_mt):
-            err = install_prepare_inputs_dict_patch(orig_prepare, get_state_mt, self.set_global)
+            err = install_prepare_inputs_dict_patch(orig_prepare, get_state_mt, self.set_global, get_base_mt)
             if err:
                 print(f"[H3RefMod] {err}")
         else:
@@ -324,7 +335,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         orig_get_model_settings = getattr(self, "get_model_settings", None)
         if callable(orig_get_model_settings):
-            err2 = install_get_model_settings_patch(orig_get_model_settings, self.set_global)
+            err2 = install_get_model_settings_patch(orig_get_model_settings, self.set_global, get_base_mt)
             if err2:
                 print(f"[H3RefMod] {err2}")
         else:
@@ -384,9 +395,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             w.change(fn=apply_selection, inputs=[self.state] + widgets, outputs=[self.state, status], queue=False)
 
         if target is not None:
+            get_base_mt = getattr(self, "get_base_model_type", None)
+
             def update_visibility(target_value):
                 model_type = str(target_value or "").split("|", 1)[0].strip()
-                return gr.update(visible=model_type.startswith("minimax_h3_ref2va"))
+                return gr.update(visible=is_minimax_h3_ref2va(model_type, get_base_mt))
 
             target.change(fn=update_visibility, inputs=[target], outputs=[accordion], queue=False)
         else:

@@ -72,6 +72,38 @@ FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24   # matches plugin.py's own constant of t
 _PATCH_MARKER = "_h3refmod_plugin_patched"
 
 
+def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
+    """True if ``model_type`` -- which may be an arbitrary finetune name,
+    not necessarily prefixed with "minimax_h3_ref2va" -- is actually a
+    MiniMax H3 Ref2VA-family model once resolved to its true underlying
+    architecture.
+
+    A finetune's model_type identifier is an arbitrary string chosen at
+    finetune-creation time (often derived from a checkpoint filename or a
+    display name the user typed) and is *not* guaranteed to start with the
+    base architecture's own name -- so a plain prefix check on model_type
+    alone is unreliable and will silently misclassify some finetunes.
+    ``get_base_model_type_fn`` (Wan2GP's own ``get_base_model_type``, when
+    available) resolves to ``model_def["architecture"]`` instead, which
+    always correctly reflects a finetune's true base regardless of how it
+    was named. Falls back to a plain prefix check on ``model_type`` itself
+    if the resolver isn't available (e.g. an older Wan2GP build without it)
+    -- still correct for the common case where a finetune's own name does
+    happen to start with the architecture name, just not for others.
+    """
+    model_type = str(model_type or "")
+    if not model_type:
+        return False
+    if callable(get_base_model_type_fn):
+        try:
+            base = get_base_model_type_fn(model_type)
+            if base:
+                return str(base).startswith("minimax_h3_ref2va")
+        except Exception:
+            pass
+    return model_type.startswith("minimax_h3_ref2va")
+
+
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
@@ -383,7 +415,8 @@ def install_patches() -> Optional[str]:
 _PREPARE_INPUTS_PATCH_MARKER = "_h3refmod_prepare_inputs_patched"
 
 
-def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_type_fn, set_global_fn) -> Optional[str]:
+def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_type_fn, set_global_fn,
+                                      get_base_model_type_fn=None) -> Optional[str]:
     """Lets the inline RefMods panel (injected onto Wan2GP's own Media
     Generator page, see plugin.py's ``_build_inline_refmods_section``) affect
     generations started from *that page's own* Generate button, without
@@ -405,6 +438,9 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
     -- surviving exactly the autosave cycle that would otherwise erase it.
     The original function's behavior is fully preserved for every other
     model, and for MiniMax H3 whenever the panel's selection is empty.
+    ``get_base_model_type_fn`` (see ``is_minimax_h3_ref2va``) makes this
+    correctly recognize a MiniMax H3 Ref2VA finetune even when its own
+    model_type name doesn't start with "minimax_h3_ref2va".
     """
     if getattr(install_prepare_inputs_dict_patch, _PREPARE_INPUTS_PATCH_MARKER, False):
         return None
@@ -415,7 +451,7 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
         try:
             if isinstance(state, dict) and isinstance(result, dict):
                 resolved_type = model_type or get_state_model_type_fn(state)
-                if str(resolved_type or "").startswith("minimax_h3_ref2va"):
+                if is_minimax_h3_ref2va(resolved_type, get_base_model_type_fn):
                     stash = state.get(STASH_KEY)
                     existing = dict(result.get("custom_settings") or {})
                     if stash:
@@ -444,7 +480,8 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
 _GET_MODEL_SETTINGS_PATCH_MARKER = "_h3refmod_get_model_settings_patched"
 
 
-def install_get_model_settings_patch(orig_get_model_settings, set_global_fn) -> Optional[str]:
+def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
+                                     get_base_model_type_fn=None) -> Optional[str]:
     """Closes a gap the ``prepare_inputs_dict`` patch above doesn't cover:
     `Generate` (``process_prompt_and_add_tasks`` in wgp.py) does *not* call
     ``prepare_inputs_dict`` again -- it reads the task straight out of
@@ -463,6 +500,9 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn) -> 
     time, right at the point the task is actually assembled -- the last
     possible moment before it's queued. Every other model, and MiniMax H3
     with an empty selection, are returned completely unchanged.
+    ``get_base_model_type_fn`` (see ``is_minimax_h3_ref2va``) makes this
+    correctly recognize a MiniMax H3 Ref2VA finetune even when its own
+    model_type name doesn't start with "minimax_h3_ref2va".
     """
     if getattr(install_get_model_settings_patch, _GET_MODEL_SETTINGS_PATCH_MARKER, False):
         return None
@@ -471,7 +511,7 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn) -> 
         settings = orig_get_model_settings(state, model_type)
         try:
             if (isinstance(settings, dict) and isinstance(state, dict)
-                    and str(model_type or "").startswith("minimax_h3_ref2va")):
+                    and is_minimax_h3_ref2va(model_type, get_base_model_type_fn)):
                 stash = state.get(STASH_KEY)
                 existing = dict(settings.get("custom_settings") or {})
                 if stash:
