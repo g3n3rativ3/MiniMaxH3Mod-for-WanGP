@@ -1,0 +1,9 @@
+# safetensors, torch, numpy and Pillow are already required by Wan2GP itself,
+# so they are not repeated here.
+#
+# opencv-python is an optional video-loading backend used only when
+# extracting a RefMod from an uploaded *video* file. Wan2GP already ships
+# imageio for its own video I/O, so this plugin falls back to imageio
+# automatically if opencv is not present -- this line is a nice-to-have,
+# not a hard requirement.
+opencv-python-headless

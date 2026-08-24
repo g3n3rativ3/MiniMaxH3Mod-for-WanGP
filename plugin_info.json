@@ -1,0 +1,10 @@
+{
+  "name": "MiniMax H3 RefMods",
+  "author": "ported for Wan2GP by community, original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
+  "version": "0.22.0",
+  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA: compress an image/video reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation.",
+  "type": ["app"],
+  "date": "2026-08-19",
+  "wan2gp_version": "",
+  "url": "https://github.com/deepbeepmeep/Wan2GP"
+}
