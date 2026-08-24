@@ -441,6 +441,66 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
     return None
 
 
+_GET_MODEL_SETTINGS_PATCH_MARKER = "_h3refmod_get_model_settings_patched"
+
+
+def install_get_model_settings_patch(orig_get_model_settings, set_global_fn) -> Optional[str]:
+    """Closes a gap the ``prepare_inputs_dict`` patch above doesn't cover:
+    `Generate` (``process_prompt_and_add_tasks`` in wgp.py) does *not* call
+    ``prepare_inputs_dict`` again -- it reads the task straight out of
+    ``get_model_settings(state, model_type)``, a plain cache lookup
+    (``state["all_settings"][model_type]``) last refreshed whenever
+    ``save_inputs``/``prepare_inputs_dict`` most recently ran. Since that
+    only happens on a *native* form field changing (see the docstring
+    above), if the very last thing the user touched before clicking
+    Generate was a RefMod picker in the inline panel -- not any native
+    field -- that cache is stale and the task would be built from
+    whatever RefMod selection existed the last time a native field changed,
+    not the current one.
+
+    This wraps ``get_model_settings`` itself (also via ``set_global``) so
+    the exact same freshest-``state[STASH_KEY]`` injection happens one more
+    time, right at the point the task is actually assembled -- the last
+    possible moment before it's queued. Every other model, and MiniMax H3
+    with an empty selection, are returned completely unchanged.
+    """
+    if getattr(install_get_model_settings_patch, _GET_MODEL_SETTINGS_PATCH_MARKER, False):
+        return None
+
+    def patched_get_model_settings(state, model_type):
+        settings = orig_get_model_settings(state, model_type)
+        try:
+            if (isinstance(settings, dict) and isinstance(state, dict)
+                    and str(model_type or "").startswith("minimax_h3_ref2va")):
+                stash = state.get(STASH_KEY)
+                existing = dict(settings.get("custom_settings") or {})
+                if stash:
+                    existing[SETTING_GENERATE] = stash
+                    settings = dict(settings)
+                    settings["custom_settings"] = existing
+                elif SETTING_GENERATE in existing:
+                    existing.pop(SETTING_GENERATE, None)
+                    settings = dict(settings)
+                    settings["custom_settings"] = existing or None
+        except Exception:
+            _log("get_model_settings patch: RefMod freshness check failed, leaving settings "
+                 "untouched for this call:\n" + traceback.format_exc())
+        return settings
+
+    try:
+        set_global_fn("get_model_settings", patched_get_model_settings)
+    except Exception as e:
+        msg = f"could not patch get_model_settings ({e!r}); a RefMod change right before " \
+             f"clicking Generate (with no other field touched in between) may not always " \
+             f"be picked up."
+        _log(msg)
+        return msg
+    setattr(install_get_model_settings_patch, _GET_MODEL_SETTINGS_PATCH_MARKER, True)
+    _log("hooked get_model_settings so the inline panel's RefMod selection is always fresh "
+         "at the moment Generate actually queues the task")
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Generation-time injection
 # ═══════════════════════════════════════════════════════════════════════════

@@ -37,7 +37,8 @@ import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, storage
-from .patches import SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches, install_prepare_inputs_dict_patch
+from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
+                      install_get_model_settings_patch, install_prepare_inputs_dict_patch)
 
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
@@ -257,7 +258,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.22.0"
+        self.version = "0.23.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -271,6 +272,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         self.request_global("refresh_model_defs")
         self.request_global("prepare_inputs_dict")
         self.request_global("get_state_model_type")
+        self.request_global("get_model_settings")
         self.add_tab(tab_id=PlugIn_Id, label=PlugIn_Name, component_constructor=self.create_ui)
         self.insert_after(target_component_id="loras_multipliers",
                           new_component_constructor=self._build_inline_refmods_section)
@@ -319,6 +321,18 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                  "Wan2GP's plugin globals; the inline RefMods panel on the Media Generator page "
                  "will be visible but will not affect generations from that page's own Generate "
                  "button. Use the plugin's own 'Generate' tab instead.")
+
+        orig_get_model_settings = getattr(self, "get_model_settings", None)
+        if callable(orig_get_model_settings):
+            err2 = install_get_model_settings_patch(orig_get_model_settings, self.set_global)
+            if err2:
+                print(f"[H3RefMod] {err2}")
+        else:
+            print("[H3RefMod] get_model_settings was not exposed by Wan2GP's plugin globals; "
+                 "a RefMod change right before clicking Generate (with no other field touched "
+                 "in between) may not always be picked up from the inline panel -- change any "
+                 "other field (e.g. click into the prompt box) once after picking mods as a "
+                 "workaround, or use the plugin's own 'Generate' tab instead.")
         return {}
 
     # ── Inline panel injected onto the Media Generator page ───────────────

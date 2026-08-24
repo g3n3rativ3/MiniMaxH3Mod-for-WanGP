@@ -426,6 +426,18 @@ load time:
    bicubic-resize (and no pixel tensor to `.permute()`) -- the latent goes
    into the packed sequence at its own saved resolution. On older builds
    without this helper the patch is simply skipped.
+11. `get_model_settings` (a plain wgp.py function, patched via
+   `self.set_global` like `prepare_inputs_dict`) closes a gap that one
+   doesn't cover: clicking **Generate** on the Media Generator page doesn't
+   call `prepare_inputs_dict` again -- it reads the task straight out of
+   `get_model_settings(state, model_type)`, a cache last refreshed whenever
+   `save_inputs`/`prepare_inputs_dict` most recently ran, which only
+   happens when a *native* form field changes. If the last thing touched
+   before clicking Generate was a RefMod picker in the inline panel and
+   nothing else, that cache could be one selection behind. This wraps
+   `get_model_settings` to re-apply the same freshest-`state[STASH_KEY]`
+   injection one more time, right at the point the task is actually
+   assembled -- the last possible moment before it's queued.
 
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
