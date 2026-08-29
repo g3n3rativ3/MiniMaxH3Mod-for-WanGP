@@ -46,6 +46,7 @@ PlugIn_Id = "H3RefMods"
 
 IMAGE_ROWS = 9  # matches MiniMax H3 Ref2VA's own native cap on image-kind references
 VIDEO_ROWS = 2  # matches MiniMax H3 Ref2VA's own native cap on video-kind references
+AUDIO_ROWS = 2  # matches MiniMax H3 Ref2VA's own native cap on audio-kind references
 NONE_CHOICE = "(none)"
 
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
@@ -117,8 +118,9 @@ def _diagnose(api_session, model_type, patch_error):
 
 def _mod_choices(kind=None):
     """[(none), name, name, ...], optionally restricted to mods of a given
-    "image"/"video" kind so a slot can only ever offer mods that fit it."""
-    if kind in ("image", "video"):
+    "image"/"video"/"audio" kind so a slot can only ever offer mods that
+    fit it."""
+    if kind in ("image", "video", "audio"):
         names = storage.list_refmods_by_kind(kind)
     else:
         names = storage.list_refmods()
@@ -127,9 +129,10 @@ def _mod_choices(kind=None):
 
 def _refresh_mod_dropdown_updates():
     """gr.update(...) for every mod-picker dropdown built by
-    _build_mod_picker_rows, in the same image-then-video order."""
+    _build_mod_picker_rows, in the same image-then-video-then-audio order."""
     return ([gr.update(choices=_mod_choices("image")) for _ in range(IMAGE_ROWS)]
-           + [gr.update(choices=_mod_choices("video")) for _ in range(VIDEO_ROWS)])
+           + [gr.update(choices=_mod_choices("video")) for _ in range(VIDEO_ROWS)]
+           + [gr.update(choices=_mod_choices("audio")) for _ in range(AUDIO_ROWS)])
 
 
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24  # MiniMax H3's own default fps -- only used to turn a
@@ -166,19 +169,29 @@ def seconds_to_latent_frames(seconds, fps: int = FPS_ASSUMED_FOR_DURATION_ESTIMA
     return max(1, round((t_px - 1) / 4) + 1)
 
 
+AUDIO_LATENTS_PER_SECOND = 40  # MiniMax H3's own audio VAE: encoder downsamples by 800x at
+                               # 32kHz = 40 latents/s exactly (models/minimax_h3/components/
+                               # audio_autoencoder.py's own docstring) -- unlike the video
+                               # estimate below, this is an exact, fps-independent rate, not
+                               # an approximation.
+
+
 def _format_ref_counter(row_pairs):
-    """A live 'how close to MiniMax H3 Ref2VA's native reference caps am I'
-    readout, from the current (mod_name, strength) values of every picker
-    row (image rows then video rows, any order internally). Mirrors exactly
-    what _inject_refmods will actually send at generation time: rows with no
-    mod picked or strength<=0 are skipped, and -- critically -- an
-    image-kind mod counts once *per frame it contains* (see patches.py's
-    _inject_refmods: a multi-image stack gets split into one reference per
-    frame), not once per mod. Video-kind mods, by contrast, always combine
-    into a single reference no matter how many are picked, so what actually
-    matters for them is total duration, not count."""
+    """A live 'how close to MiniMax H3 Ref2VA's own native reference caps am
+    I' readout, from the current (mod_name, strength) values of every
+    picker row (image rows, then video rows, then audio rows, any order
+    internally). Mirrors exactly what _inject_refmods will actually send at
+    generation time: rows with no mod picked or strength<=0 are skipped,
+    and -- critically -- an image-kind mod counts once *per frame it
+    contains* (see patches.py's _inject_refmods: a multi-image stack gets
+    split into one reference per frame), not once per mod. Video- and
+    audio-kind mods, by contrast, each go into their own native reference
+    slot no matter how many are picked, so what actually matters for them
+    is total duration (each against its own, separate 15-second budget --
+    video and audio don't share one)."""
     n_images = 0
     video_latent_frames = 0
+    audio_seconds_total = 0.0
     for name, strength in row_pairs:
         try:
             strength = float(strength)
@@ -196,19 +209,25 @@ def _format_ref_counter(row_pairs):
         latent_t = max(1, int(meta.get("latent_t", 1)))
         if kind == "image":
             n_images += latent_t
-        else:
+        elif kind == "video":
             t_px = (latent_t - 1) * 4 + 1 if latent_t > 1 else 1  # undo the causal 4:1 compression
             video_latent_frames += t_px
+        else:  # "audio"
+            audio_seconds_total += latent_t / AUDIO_LATENTS_PER_SECOND
     video_seconds = video_latent_frames / FPS_ASSUMED_FOR_DURATION_ESTIMATE
     img_mark = "⚠️" if n_images > 9 else "▫️" if n_images == 0 else "✅"
     vid_mark = "⚠️" if video_seconds > 15 else "▫️" if video_seconds == 0 else "✅"
+    aud_mark = "⚠️" if audio_seconds_total > 15 else "▫️" if audio_seconds_total == 0 else "✅"
     warn = ""
     if n_images > 9:
         warn += " -- **too many images, generation will fail.** A multi-image mod counts once per image it contains."
     if video_seconds > 15:
-        warn += " -- **too long, generation will fail.**"
+        warn += " -- **too much video, generation will fail.**"
+    if audio_seconds_total > 15:
+        warn += " -- **too much audio, generation will fail.**"
     return (f"{img_mark} **Images: {n_images} / 9**&nbsp;&nbsp;&nbsp;"
-           f"{vid_mark} **Video: ~{video_seconds:.1f}s / 15s** (estimated at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)"
+           f"{vid_mark} **Video: ~{video_seconds:.1f}s / 15s** (estimated at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)&nbsp;&nbsp;&nbsp;"
+           f"{aud_mark} **Audio: {audio_seconds_total:.1f}s / 15s**"
            f"{warn}")
 
 
@@ -259,7 +278,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.24.0"
+        self.version = "0.26.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -375,7 +394,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         def apply_selection(state, *vals):
             rows = []
-            n_rows = IMAGE_ROWS + VIDEO_ROWS
+            n_rows = IMAGE_ROWS + VIDEO_ROWS + AUDIO_ROWS
             for i in range(n_rows):
                 mdd, strength = vals[i * 2], vals[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:
@@ -427,14 +446,15 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
     def _build_mod_picker_rows(self):
         """A "Refresh mod list" button + a live reference-budget counter,
-        followed by IMAGE_ROWS image-kind + VIDEO_ROWS video-kind mod picker
-        rows (dropdown restricted to that kind, plus strength), matching
-        MiniMax H3 Ref2VA's own native reference caps. The refresh button
-        and counter live here (above the rows, for visibility) and are
-        fully wired before returning. Returns the flat list of
-        (dropdown, strength) pairs, image rows first then video rows --
-        callers must keep that same order when reading values back
-        (_refresh_mod_dropdown_updates() above does too)."""
+        followed by IMAGE_ROWS image-kind + VIDEO_ROWS video-kind +
+        AUDIO_ROWS audio-kind mod picker rows (dropdown restricted to that
+        kind, plus strength), matching MiniMax H3 Ref2VA's own native
+        reference caps. The refresh button and counter live here (above the
+        rows, for visibility) and are fully wired before returning. Returns
+        the flat list of (dropdown, strength) pairs, image rows first, then
+        video rows, then audio rows -- callers must keep that same order
+        when reading values back (_refresh_mod_dropdown_updates() above
+        does too)."""
         refresh_btn = gr.Button("🔄 Refresh mod list", size="sm")
         counter = gr.Markdown(_format_ref_counter([]))
         mod_rows = []
@@ -450,6 +470,13 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             with gr.Row():
                 mdd = gr.Dropdown(choices=_mod_choices("video"), value=NONE_CHOICE,
                                   label=f"Video Mod {i + 1}", scale=3)
+                strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
+                mod_rows.append((mdd, strength))
+        gr.Markdown(f"**Audio RefMods** (up to {AUDIO_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
+        for i in range(AUDIO_ROWS):
+            with gr.Row():
+                mdd = gr.Dropdown(choices=_mod_choices("audio"), value=NONE_CHOICE,
+                                  label=f"Audio Mod {i + 1}", scale=3)
                 strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
                 mod_rows.append((mdd, strength))
         refresh_btn.click(fn=_refresh_mod_dropdown_updates, outputs=[r[0] for r in mod_rows], queue=False)
@@ -485,6 +512,12 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             ref_video2 = gr.Video(label="Reference video 2 (optional)")
         gr.Markdown("*MiniMax H3 Ref2VA natively supports up to two reference videos "
                    "('Use Two Reference Videos') -- both are encoded and combined into this one mod.*")
+        ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath")
+        gr.Markdown("*Audio can't be combined with image/video sources in the same mod (their "
+                   "encoded shapes are structurally different) -- providing audio here along "
+                   "with images/video is refused with a clear error rather than mixed. Always "
+                   "extracted at full fidelity; 'Mode' above doesn't apply to audio.*")
+        audio_duration_warning = gr.Markdown("")
         remove_background_images_ref = gr.Dropdown(
             choices=[("Keep Backgrounds behind all Reference Images", 0),
                     ("Remove Background behind People / Objects", 1)],
@@ -504,13 +537,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             with gr.Row():
                 latent_frames = gr.Slider(0.1, latent_frames_to_seconds(MAX_LATENT_FRAMES),
                                           value=latent_frames_to_seconds(16), step=0.1,
-                                          label="Video reference duration to use (seconds)",
-                                          info="Approximate real seconds of the source video kept for "
-                                               "a video-kind ref. MiniMax H3's native 15s reference cap "
-                                               "is a **shared** budget -- **if a generation combines two "
-                                               "video-kind mods, their durations add together, so one "
-                                               "mod near 14.9s leaves no room for a second one alongside "
-                                               "it.**")
+                                          label="Reference duration to use (seconds) -- video AND audio",
+                                          info="Approximate real seconds kept from the source, for a "
+                                               "video-kind ref **or** an audio-kind ref (whichever you're "
+                                               "extracting) -- always double-check this before extracting "
+                                               "audio, since it defaults to a short video-sized value and "
+                                               "audio has no separate duration control of its own. "
+                                               "MiniMax H3's native 15s reference cap is a **shared** "
+                                               "budget within its own kind -- **if a generation combines "
+                                               "two video-kind (or two audio-kind) mods, their durations "
+                                               "add together, so one mod near 14.9s leaves no room for a "
+                                               "second one of the same kind alongside it.**")
                 identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps (training mode)",
                                      info="Training mode. Higher = truer to original.")
                 multiplier = gr.Slider(1, 10, value=1, step=1, label="Repeat multiplier",
@@ -537,17 +574,43 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             w.change(fn=update_pool_warning, inputs=[concept_type, mode, pool_h, pool_w],
                     outputs=[pool_warning], queue=False)
 
-        def do_extract(model_type, name, mode, concept_type, ref_images, ref_video, ref_video2,
+        def update_audio_duration_warning(audio_path, current_seconds):
+            if not audio_path:
+                return ""
+            try:
+                import soundfile as sf
+                info = sf.info(audio_path)
+                real_seconds = info.frames / info.samplerate
+            except Exception:
+                return ""
+            if real_seconds > float(current_seconds) + 0.15:
+                return (f"⚠️ This audio file is ~{real_seconds:.1f}s long, but 'Reference duration "
+                       f"to use' above is only set to {float(current_seconds):.1f}s -- only the "
+                       f"first {float(current_seconds):.1f}s will be kept. Raise it (up to "
+                       f"{latent_frames_to_seconds(MAX_LATENT_FRAMES)}s) to use more of this "
+                       f"recording.")
+            return ""
+
+        for w in (ref_audio, latent_frames):
+            w.change(fn=update_audio_duration_warning, inputs=[ref_audio, latent_frames],
+                    outputs=[audio_duration_warning], queue=False)
+
+        def do_extract(model_type, name, mode, concept_type, ref_images, ref_video, ref_video2, ref_audio,
                        remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                        identity, multiplier, max_tokens, description, save):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
-            if not image_paths and not ref_video and not ref_video2:
-                return "Add at least one reference image or a reference video."
+            if not image_paths and not ref_video and not ref_video2 and not ref_audio:
+                return "Add at least one reference image, video, or audio file."
+            if ref_audio and (image_paths or ref_video or ref_video2):
+                return ("Audio can't be combined with image/video sources in the same mod -- "
+                       "clear the image/video fields to extract an audio-only mod, or clear "
+                       "the audio field to extract an image/video mod.")
             spec = {
                 "name": name, "mode": mode, "concept_type": concept_type,
                 "image_paths": image_paths, "video_path": ref_video, "video_path2": ref_video2,
+                "audio_path": ref_audio,
                 "remove_background_images_ref": int(remove_background_images_ref or 0),
                 "ref_resolution": int(ref_resolution), "pool_h": int(pool_h), "pool_w": int(pool_w),
                 "latent_frames": seconds_to_latent_frames(latent_frames), "identity": int(identity),
@@ -578,7 +641,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         extract_btn.click(
             fn=do_extract,
-            inputs=[model_dd, name, mode, concept_type, ref_images, ref_video, ref_video2,
+            inputs=[model_dd, name, mode, concept_type, ref_images, ref_video, ref_video2, ref_audio,
                    remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                    identity, multiplier, max_tokens, description, save],
             outputs=[extract_status],
@@ -811,7 +874,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             if not model_type:
                 raise gr.Error("Pick a MiniMax H3 Ref2VA model above first.")
             rows = []
-            n_rows = IMAGE_ROWS + VIDEO_ROWS
+            n_rows = IMAGE_ROWS + VIDEO_ROWS + AUDIO_ROWS
             for i in range(n_rows):
                 mdd, strength = row_values[i * 2], row_values[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:

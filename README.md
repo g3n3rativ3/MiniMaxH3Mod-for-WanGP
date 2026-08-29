@@ -136,20 +136,30 @@ actually ends up in the saved tensor, unlike the metadata-only fields below:
   pool grid sliders when `concept_type=identity` is combined with a small
   grid. Smaller file, fewer tokens at generation time.
 
-**Video reference duration to use (seconds)** shows and sets this directly
-in real seconds of the source video (0.1s steps) rather than the abstract
-"latent frames" count the underlying extraction actually works in -- so if
-your video is 4 seconds long, you can just drag the slider to 4.0s instead
-of guessing what frame-count number that corresponds to. It goes up to
-14.9s -- MiniMax H3 Ref2VA's own 15-second reference cap works out to about
-90 latent frames once the video VAE's causal 4:1 temporal compression is
-accounted for (verified: 90 latent frames ≈ 357 pixel frames ≈ 14.9s at
-24fps; the next notch up would already be over 15s). This is a **shared**
-budget: if a generation combines two video-kind mods (the two "Video Mod"
-slots), their durations *add together* against that same 15s ceiling, so a
-single mod extracted near 14.9s leaves no room for a second one alongside
-it -- the live counter (Generate tab / inline panel) always shows the real
-total for whatever's currently selected.
+**Reference duration to use (seconds) -- video AND audio** shows and sets
+this directly in real seconds of the source (0.1s steps) rather than the
+abstract "latent frames" count the underlying extraction actually works in
+-- so if your video (or audio) is 4 seconds long, you can just drag the
+slider to 4.0s instead of guessing what frame-count number that
+corresponds to. **This one slider bounds both video-kind and audio-kind
+extraction** -- there's no separate audio duration control, and it defaults
+to a short, video-sized value (2.5s), so double-check it before extracting
+audio: a live warning appears next to the audio upload field if the
+uploaded file is longer than the current setting, since leaving it at
+default silently keeps only the first few seconds of a longer recording
+(functionally fine if just the voice's timbre matters, since even a couple
+of seconds usually carries that, but not what you asked for if you wanted
+the whole clip). It goes up to 14.9s -- MiniMax H3 Ref2VA's own 15-second
+reference cap works out to about 90 latent frames once the video VAE's
+causal 4:1 temporal compression is accounted for (verified: 90 latent
+frames ≈ 357 pixel frames ≈ 14.9s at 24fps; the next notch up would already
+be over 15s) -- and audio has its own, separately-verified 15s cap too (see
+"Audio RefMods" below). This is a **shared** budget within each kind: if a
+generation combines two video-kind mods (or two audio-kind mods), their
+durations *add together* against that kind's own 15s ceiling, so a single
+mod extracted near 14.9s leaves no room for a second one of the same kind
+alongside it -- the live counter (Generate tab / inline panel) always shows
+the real total for whatever's currently selected, per kind.
 
 A source video always contributes a **contiguous** clip from its start,
 matching the slider as closely as the video VAE's own frame grid allows --
@@ -158,7 +168,8 @@ frames sparsely across the *entire* source video instead of a contiguous
 prefix; the video VAE has no idea a "frame" was pulled from 8 seconds in
 rather than 0.3 seconds in, so it compressed the scattered sample as if it
 were a real, short, sequential clip -- silently breaking the slider's
-promise. Fixed.)
+promise. Fixed.) Audio extraction takes a contiguous clip from its start
+the same way.
 
 Two things can still make the *saved* mod end up shorter than what you
 asked for -- extraction always tells you plainly when this happens, with
@@ -166,13 +177,16 @@ the requested vs. actual duration:
 - In `training` mode, the slider is a **ceiling, not a guarantee**: pooling
   can't invent seconds the source video didn't produce enough of once
   VAE-compressed, so a short source video ends up shorter than requested no
-  matter how high the slider is set.
+  matter how high the slider is set. (Doesn't apply to audio -- there's no
+  `training` mode for it.)
 - **`Max tokens`** (Advanced, defaults to 65536 -- unlocked, so it stays out
   of the way for most extractions) applies *after* encoding, and `encode`
   mode at a high "Ref resolution" can still burn through even that: a
   1024px `encode`-mode video ref costs 1024 tokens per frame, so 65536
   tokens fits about 64 frames (~10.6s). Past that point -- or with a lower
-  budget set deliberately -- the mod still gets saved, just shorter.
+  budget set deliberately -- the mod still gets saved, just shorter. Audio
+  costs far fewer tokens per frame (2, stereo) so this is rarely the
+  binding constraint for it -- the duration slider itself usually is.
 
 **Automatic background removal (optional).** Same "Automatic Removal of
 Background behind People or Objects in Reference Images" toggle Wan2GP's own
@@ -198,6 +212,46 @@ prompt yourself):
   `identity: ginger woman, tattooed neck`), the same way the original
   ComfyUI pack's loader does -- and also drives the live pool-grid warning
   mentioned above.
+
+### Audio RefMods
+
+MiniMax H3 Ref2VA also supports up to 2 **direct** audio references ("Use
+one/two audio references", flags `A`/`B`) -- distinct from "Use
+reference-video soundtrack(s)" (flag `K`), which extracts audio *from* a
+reference video rather than taking a standalone audio file. This plugin
+covers the direct case with its own mod kind.
+
+**Extracting one.** Upload a file in the **Reference audio** field on the
+Extract tab -- it can't be combined with image/video sources in the same
+mod (an audio VAE latent `[1, 32, 2, T]`, channels x stereo x time, is
+structurally incompatible to stack alongside a visual one
+`[1, 24, T, H, W]`); providing both is refused with a clear error rather
+than silently mixed or dropped. Audio mods are always extracted at full
+VAE fidelity -- there's no spatial grid to pool the way image/video mods
+can in `training` mode, so `Mode` above the upload fields doesn't apply to
+audio at all. There's no separate audio duration control -- see "Reference
+duration to use" above; a live warning appears next to the upload field if
+the file is longer than the current setting, since that setting defaults
+to a short, video-sized value (2.5s). `Max tokens` and `Repeat multiplier`
+apply as for image/video, just with the audio VAE's own, exact conversion
+rate (40 latents/second at 32kHz, verified against
+`components/audio_autoencoder.py`'s own docstring -- not an fps-based
+estimate the way the video duration figure is).
+
+**Using one.** Same as image/video RefMods: pick it in an "Audio Mod 1/2"
+slot (Generate tab or the inline panel) and it goes straight into
+`audio_guide`/`audio_guide2`, one mod per native slot, the same two slots
+"Use one/two audio references" itself uses -- so at generation time it's
+indistinguishable from having recorded that exact audio and uploaded it
+live. If the current generation already has "Use reference-video
+soundtrack(s)" turned on, audio-kind RefMods are skipped with a clear log
+message rather than silently overwritten -- the two features read the same
+two underlying slots for genuinely different purposes and can't share them
+in one generation.
+
+The live reference-budget counter tracks audio the same way it tracks
+images and video, as a third, **separate** 15-second budget (video and
+audio each have their own native cap -- they don't share one).
 
 ### Library
 
@@ -438,6 +492,13 @@ load time:
    `get_model_settings` to re-apply the same freshest-`state[STASH_KEY]`
    injection one more time, right at the point the task is actually
    assembled -- the last possible moment before it's queued.
+12. `_load_audio_reference` and `_add_audio_reference` (both bound methods
+   on `MiniMaxH3Pipeline`, patched the same way as their image/video
+   counterparts) let an audio-kind RefMod's sentinel pass through and skip
+   re-encoding, exactly mirroring points 2 and 3 above -- `generate()` calls
+   `_load_audio_reference(audio_guide)` inline, *before* `_add_audio_reference`
+   ever sees it, so the loader needs the same "pass a sentinel through
+   untouched" treatment `_as_video` gets for video.
 
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
@@ -452,9 +513,11 @@ Compared to the ComfyUI pack, this version does **not** include:
 - Saved/shareable curve-graph PNG presets.
 - The per-denoising-step curve wrapper (`H3 RefMod Step Curve`) -- only the
   per-frame curve (baked in once, at injection time) is available here.
-- More than 2 simultaneous **video-kind** mods in one generation, and at most
-  9 **image-kind** mods, at most 12 total -- these are Wan2GP's own native
-  Ref2VA reference limits, not an extra restriction added by this plugin.
+- More than 2 simultaneous **video-kind** mods in one generation, at most 2
+  **audio-kind** mods, and at most 9 **image-kind** mods (12 total) -- these
+  are Wan2GP's own native Ref2VA reference limits, not an extra restriction
+  added by this plugin. Video and audio each have their **own**, separate
+  15-second budget -- they don't share one.
   **A mod extracted from several stacked images counts once per image it
   contains**, not once per mod: a mod trained on 5 images uses 5 of the 9
   available image slots by itself. This isn't a soft cap this plugin could
@@ -463,13 +526,14 @@ Compared to the ComfyUI pack, this version does **not** include:
   frame either crashes or leaves every frame at the exact same position
   (silently indistinguishable to the model), rather than degrading
   gracefully. A live counter above the mod pickers (**Images: X / 9**,
-  **Video: ~Xs / 15s**) tracks this in real time, accounting for strength,
-  copies, and each selected mod's own frame count, so you don't have to do
-  the math by hand or discover an overflow only when generation fails.
+  **Video: ~Xs / 15s**, **Audio: Xs / 15s**) tracks this in real time,
+  accounting for strength, copies, and each selected mod's own frame count,
+  so you don't have to do the math by hand or discover an overflow only
+  when generation fails.
 - The inline panel (and this plugin's own Generate tab) offer 9 image-kind +
-  2 video-kind mod slots -- matching MiniMax H3 Ref2VA's own native caps on
-  each, so there's no situation where a slot is available but couldn't
-  possibly be used.
+  2 video-kind + 2 audio-kind mod slots -- matching MiniMax H3 Ref2VA's own
+  native caps on each, so there's no situation where a slot is available but
+  couldn't possibly be used.
 - The inline panel hides automatically after a model switch (see "How the
   inline panel works" below), but stays visible right after Wan2GP starts
   if a MiniMax H3 Ref2VA model was already selected and nothing else has

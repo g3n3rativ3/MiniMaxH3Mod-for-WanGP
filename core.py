@@ -125,6 +125,23 @@ def _blur_latent(z: torch.Tensor, factor: int = 8) -> torch.Tensor:
     return up.to(z.dtype)
 
 
+def _blur_audio_latent(z: torch.Tensor, factor: int = 8) -> torch.Tensor:
+    """Audio analog of _blur_latent(): a heavy temporal low-pass (downsample
+    then upsample along the time axis only) used as the same "weakening
+    target" for strengths below 1.0, and the extrapolation direction for
+    strengths above 1.0 -- same rationale as the visual version, just with
+    no spatial H/W axes to blur (an audio latent is [1, C, S, T], channels x
+    stereo x time, not channels x time x height x width)."""
+    if z.dim() != 4:
+        return z
+    b, c, s, t = z.shape
+    st = max(1, t // factor)
+    flat = z.float().reshape(b, c * s, t)
+    down = F.adaptive_avg_pool1d(flat, st)
+    up = F.interpolate(down, size=t, mode="linear", align_corners=False)
+    return up.reshape(b, c, s, t).to(z.dtype)
+
+
 def infer_kind_from_tags(tags, fallback: str) -> str:
     """Best-effort correct ``kind`` from a mod's own ``tags`` (which record
     "{n_img} img, {n_vid} vid" at extraction time): "video" if any real video
@@ -371,21 +388,70 @@ def fit_token_budget(latent: torch.Tensor, budget: int, label: str) -> Tuple[tor
     return latent, messages
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# H3RefMod -- the saved artifact
-# ═══════════════════════════════════════════════════════════════════════════
+def dedup_audio_frame_indices(z: torch.Tensor, threshold: float = 0.02) -> List[int]:
+    """Audio analog of dedup_frame_indices() -- greedy temporal dedup along
+    an audio latent's own time axis (dim -1 of a [1, C, S, T] tensor,
+    versus dim 2 of a visual [1, C, T, H, W] tensor)."""
+    t = z.shape[-1]
+    if t <= 1:
+        return list(range(t))
+    flat = z[0].float().reshape(-1, t)  # [C*S, T]
+    kept = [0]
+    prev = flat[:, 0]
+    for i in range(1, t):
+        cur = flat[:, i]
+        denom = (cur.abs().mean() + prev.abs().mean()) / 2 + 1e-6
+        diff = (cur - prev).abs().mean() / denom
+        if diff >= threshold:
+            kept.append(i)
+            prev = cur
+    return kept
+
+
+def fit_audio_token_budget(latent: torch.Tensor, budget: int, label: str) -> Tuple[torch.Tensor, List[str]]:
+    """Audio analog of fit_token_budget(). An audio-kind ref's row/token
+    count in the packed sequence is latent_t * MINIMAX_H3_AUDIO_CHANNELS (2,
+    stereo) -- see Wan2GP's own components/packing.py
+    (``ref.num_audio_rows = ref.num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS``),
+    not the 2x2-patch spatial formula visual refs use."""
+    messages: List[str] = []
+    per_frame = 2  # MINIMAX_H3_AUDIO_CHANNELS -- fixed by the audio VAE/packing format, not user-configurable
+    t = latent.shape[-1]
+    if per_frame * t <= budget:
+        return latent, messages
+    kept = dedup_audio_frame_indices(latent)
+    if len(kept) < t:
+        messages.append(f"{label}: over {budget}-token cap, dropped {t - len(kept)} "
+                        f"near-duplicate audio frame(s) ({t} -> {len(kept)})")
+        latent = latent[..., kept]
+        t = latent.shape[-1]
+    if per_frame * t > budget:
+        fit_t = max(1, budget // per_frame)
+        if fit_t < t:
+            idx = torch.linspace(0, t - 1, fit_t, device=latent.device).round().long()
+            latent = latent[..., idx]
+            messages.append(f"{label}: still over {budget}-token cap, resampled {t} -> {fit_t} audio frame(s)")
+    return latent, messages
+
 
 @dataclass
 class H3RefMod:
     """A compressed reference for MiniMax H3.
 
-    ``latent`` is the VAE latent [1, 24, latent_t, latent_h, latent_w] -- a
-    full-resolution encode (mode="encode") or a pooled thumbnail
-    (mode="training"). ``kind`` is "video" if any real video source was
-    included when the mod was extracted, "image" otherwise -- an "image"
-    mod can still have ``latent_t > 1`` if several still images were stacked
-    into it (each occupies its own image-reference slot at injection time,
-    matching Wan2GP's own ``refs`` payload kinds).
+    ``latent`` is the VAE latent -- for ``kind in ("image", "video")``,
+    ``[1, 24, latent_t, latent_h, latent_w]``, a full-resolution encode
+    (mode="encode") or a pooled thumbnail (mode="training"); for
+    ``kind == "audio"``, ``[1, 32, 2, latent_t]`` (channels x stereo x
+    time), always a full-resolution encode -- there is no spatial grid to
+    pool for audio, so "training" mode's compression concept doesn't apply
+    and audio mods are always extracted at full VAE fidelity.
+    ``kind`` is "video" if any real video source was included when the mod
+    was extracted, "image" otherwise -- an "image" mod can still have
+    ``latent_t > 1`` if several still images were stacked into it (each
+    occupies its own image-reference slot at injection time, matching
+    Wan2GP's own ``refs`` payload kinds). "audio" mods are always extracted
+    from a single audio file, never combined with image/video sources (the
+    latent shapes are structurally incompatible to stack together).
     """
 
     name: str
@@ -404,8 +470,8 @@ class H3RefMod:
     concept_type: str = "generic"
 
     def __post_init__(self):
-        if self.kind not in ("image", "video"):
-            raise ValueError(f"kind must be 'image' or 'video' (got {self.kind!r})")
+        if self.kind not in ("image", "video", "audio"):
+            raise ValueError(f"kind must be 'image', 'video', or 'audio' (got {self.kind!r})")
         # NOTE: kind=="image" does NOT force latent_t=1 -- an "image" mod can be
         # a stack of several independent still images (extracted together into
         # one file), each still occupying its own single-frame image-reference
@@ -418,6 +484,11 @@ class H3RefMod:
 
     @property
     def token_count(self) -> int:
+        if self.kind == "audio":
+            # ref.num_audio_rows = num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS (2) --
+            # see Wan2GP's own components/packing.py. Not the 2x2-patch spatial
+            # formula visual refs use; audio has no spatial grid to patchify.
+            return self.latent_t * 2
         per_frame = (self.latent_h // 2) * (self.latent_w // 2)
         return self.latent_t * per_frame
 
@@ -438,18 +509,19 @@ class H3RefMod:
         if strength <= 0.0:
             return None
         latent = self.latent
+        blur_fn = _blur_audio_latent if self.kind == "audio" else _blur_latent
         if curve is not None and self.latent_t > 1:
             strengths = curve_strengths(curve, self.latent_t)
             if strengths is not None:
                 t = self.latent_t
                 st = torch.tensor([max(0.0, strength * s) for s in strengths],
                                   dtype=torch.float32, device=latent.device)
-                st = st.view(1, 1, t, 1, 1)
-                blurred = _blur_latent(latent)
+                st = st.view(1, 1, 1, t) if self.kind == "audio" else st.view(1, 1, t, 1, 1)
+                blurred = blur_fn(latent)
                 return (st * latent.float() + (1.0 - st) * blurred.float()).to(latent.dtype)
         if strength == 1.0:
             return latent
-        blurred = _blur_latent(latent)
+        blurred = blur_fn(latent)
         return (strength * latent.float() + (1.0 - strength) * blurred.float()).to(latent.dtype)
 
     def save(self, path_no_ext: str) -> str:
@@ -472,13 +544,23 @@ class H3RefMod:
         if meta is None:
             raise ValueError(f"{path_no_ext}.safetensors has no RefMod metadata.")
         latent = load_file(path_no_ext + ".safetensors", device=device)["latent"].clone()
+        # NOTE: dict.get(key, fallback) always evaluates `fallback` eagerly, even
+        # when `key` is present and the fallback goes unused -- so the fallback
+        # expression itself must never index a dimension that might not exist.
+        # An audio latent is 4D ([1, C, S, T]); a visual one is 5D
+        # ([1, C, T, H, W]); latent.shape[4] would raise on the former
+        # regardless of whether meta actually had "latent_w" saved.
+        if latent.dim() == 4:
+            default_h, default_w, default_t = 4, 4, latent.shape[-1]
+        else:
+            default_h, default_w, default_t = latent.shape[3], latent.shape[4], latent.shape[2]
         return cls(
             name=meta.get("name", os.path.basename(path_no_ext)),
             kind=meta.get("kind", "image"),
             latent=latent,
-            latent_h=int(meta.get("latent_h", latent.shape[3])),
-            latent_w=int(meta.get("latent_w", latent.shape[4])),
-            latent_t=int(meta.get("latent_t", latent.shape[2])),
+            latent_h=int(meta.get("latent_h", default_h)),
+            latent_w=int(meta.get("latent_w", default_w)),
+            latent_t=int(meta.get("latent_t", default_t)),
             mode=normalize_mode(meta.get("mode", "training")),
             source=meta.get("source", ""),
             source_shape=meta.get("source_shape", ""),

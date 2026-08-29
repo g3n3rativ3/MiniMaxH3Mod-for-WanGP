@@ -7,3 +7,8 @@
 # automatically if opencv is not present -- this line is a nice-to-have,
 # not a hard requirement.
 opencv-python-headless
+
+# soundfile and torchaudio (used for audio-kind RefMod extraction) are not
+# listed here because MiniMax H3's own native "Use one/two audio
+# references" feature already requires both -- any Wan2GP install that can
+# run MiniMax H3 at all already has them.
