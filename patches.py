@@ -599,6 +599,23 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
+    window_no = kwargs.get("window_no")
+    if isinstance(window_no, int) and window_no > 1:
+        # Wan2GP's own sliding-window loop (also used by "Continue Video")
+        # only feeds its *native* references (image_refs, prefix_video, a
+        # reference video's own frames, etc.) into window_no==1 -- every
+        # later window continues from the *previous* window's own tail
+        # frames instead, not the original reference again (see wgp.py's
+        # own "if window_no == 1 and image_refs is not None..." gates).
+        # custom_settings (carrying our RefMod selection) is passed to
+        # every window's generate() call unconditionally, though -- and
+        # since RefMod injection happens down here, inside generate()
+        # itself, it has no visibility into which window this is unless we
+        # check window_no explicitly. Without this check, a video-kind (or
+        # image-kind) RefMod would get re-injected as a "reference" on
+        # every single window, so a few frames of it visibly appear at
+        # every window boundary in the output -- this is exactly that bug.
+        return kwargs
     try:
         state = json.loads(state_json)
     except Exception as e:

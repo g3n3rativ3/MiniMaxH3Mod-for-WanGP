@@ -499,6 +499,20 @@ load time:
    `_load_audio_reference(audio_guide)` inline, *before* `_add_audio_reference`
    ever sees it, so the loader needs the same "pass a sentinel through
    untouched" treatment `_as_video` gets for video.
+13. `_inject_refmods` itself checks `kwargs.get("window_no")` before doing
+   anything else, and skips RefMod injection entirely when it's an int
+   greater than 1. Wan2GP's own sliding-window loop (also used by
+   **Continue Video**) calls `generate()` once per window, passing
+   `custom_settings` (carrying the RefMod selection) unconditionally every
+   time -- but its own *native* references (`image_refs`, `prefix_video`,
+   a reference video's own frames) are only fed into `window_no==1`; every
+   later window continues from the previous window's own tail frames
+   instead, never the original reference again. Without this check, a
+   RefMod -- having no visibility into which window it's on from inside
+   `generate()` itself -- would get re-injected as a "reference" on every
+   single window, so a few frames of it would visibly appear at every
+   window boundary in the output. A plain, single-window generation never
+   sets `window_no` above 1 either, so this never affects normal use.
 
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
