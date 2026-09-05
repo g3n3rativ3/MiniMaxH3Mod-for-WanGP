@@ -148,14 +148,22 @@ class _RefModVideoSentinel:
 
 class _RefModAudioSentinel:
     """Stands in for an audio-kind reference. Carries an already-encoded,
-    already-weighted audio VAE latent [1, 32, 2, T].
+    already-weighted audio VAE latent [1, 32, 2, T] in ``.latent``.
 
-    ``generate()`` calls ``self._load_audio_reference(audio_guide)`` inline,
-    *before* ``_add_audio_reference`` (which is the only place patched to
-    actually recognize this sentinel and use its latent) ever sees it --
-    ``_load_audio_reference`` does a real ``soundfile`` file read, so it's
-    also patched (see install_patches()) to pass a sentinel through
-    untouched rather than trying to open it as a path."""
+    Newer Wan2GP builds route every audio reference through
+    ``_prepare_audio_references(sources)`` (patched below) before
+    ``_add_audio_reference`` ever sees it -- that function computes a
+    duration budget up front (``torch.is_tensor(source)`` vs.
+    ``sf.info(source).duration``) and can truncate whichever "waveform" it
+    produces per source if the combined total exceeds 15s. A plain object
+    fails the ``torch.is_tensor()`` check and would be treated as a file
+    path (crashing), and even a real ``torch.Tensor`` subclass isn't safe
+    here: the function's own truncation slicing on a real waveform doesn't
+    reliably preserve a Tensor subclass or custom attributes across the
+    op, which would silently detach ``.latent`` from the result. Patching
+    ``_prepare_audio_references`` itself to recognize this sentinel by
+    ``isinstance`` *before* any of its tensor-vs-path logic runs sidesteps
+    both problems -- see install_patches() below."""
     __slots__ = ("latent",)
 
     def __init__(self, latent: torch.Tensor):
@@ -386,6 +394,65 @@ def install_patches() -> Optional[str]:
         _log("could not find _add_audio_reference / _load_audio_reference on MiniMaxH3Pipeline "
              "to patch; audio-kind RefMods will not be available (image and video RefMods are "
              "unaffected). This Wan2GP build may not support direct audio references yet.")
+
+    _orig_prepare_audio_references = getattr(Pipeline, "_prepare_audio_references", None)
+    if _orig_prepare_audio_references is not None:
+        @functools.wraps(_orig_prepare_audio_references)
+        def patched_prepare_audio_references(self, sources):
+            # Newer Wan2GP builds route every audio reference through this
+            # function *before* _add_audio_reference ever sees it. It computes
+            # a shared 15s duration budget across all sources up front
+            # (`torch.is_tensor(source)` vs. `sf.info(source).duration`, which
+            # crashes on a plain sentinel object) and can truncate each
+            # resulting "waveform" if the combined total goes over. A RefMod
+            # sentinel is neither a real waveform tensor nor a file path, and
+            # even if it were made a torch.Tensor subclass, the function's own
+            # slicing on truncation isn't guaranteed to preserve a subclass or
+            # a custom .latent attribute across the op -- so this replicates
+            # the original function's exact duration/truncation logic, with a
+            # dedicated isinstance-checked branch for our own sentinels that
+            # operates on the real .latent tensor's own time axis instead,
+            # and re-wraps the (possibly truncated) result back into a
+            # sentinel so _add_audio_reference downstream still recognizes it.
+            # Every non-sentinel source is delegated to the untouched original
+            # per-source logic, unchanged.
+            import soundfile as sf
+
+            sources = [source for source in sources if source is not None]
+            durations = []
+            for source in sources:
+                if isinstance(source, _RefModAudioSentinel):
+                    durations.append(source.latent.shape[-1] / AUDIO_LATENTS_PER_SECOND)
+                elif torch.is_tensor(source):
+                    durations.append(source.shape[-1] / storage.AUDIO_SAMPLE_RATE)
+                else:
+                    durations.append(sf.info(source).duration)
+            max_duration = 15 / len(sources) if sources and sum(durations) > 15 else None
+
+            waveforms = []
+            for source, own_duration in zip(sources, durations):
+                if isinstance(source, _RefModAudioSentinel):
+                    latent = source.latent
+                    if max_duration is not None and own_duration > max_duration:
+                        keep_t = max(1, round(max_duration * AUDIO_LATENTS_PER_SECOND))
+                        latent = latent[..., :keep_t]
+                    waveforms.append(_RefModAudioSentinel(latent))
+                    continue
+                if torch.is_tensor(source):
+                    waveform = source
+                else:
+                    info = sf.info(source)
+                    frames = -1 if max_duration is None else round(max_duration * info.samplerate)
+                    audio, sample_rate = sf.read(source, frames=frames, dtype="float32", always_2d=True)
+                    waveform = self._waveform(audio, sample_rate)
+                if max_duration is not None:
+                    waveform = waveform[..., :round(max_duration * storage.AUDIO_SAMPLE_RATE)]
+                waveforms.append(waveform)
+            return waveforms
+        Pipeline._prepare_audio_references = patched_prepare_audio_references
+    # else: older Wan2GP builds don't have this function at all -- generate()
+    # calls _load_audio_reference/_add_audio_reference directly instead
+    # (both already patched above), so nothing extra is needed there.
 
     if _orig_as_video is not None:
         @functools.wraps(_orig_as_video)

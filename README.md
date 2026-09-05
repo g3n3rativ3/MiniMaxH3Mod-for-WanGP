@@ -499,6 +499,24 @@ load time:
    `_load_audio_reference(audio_guide)` inline, *before* `_add_audio_reference`
    ever sees it, so the loader needs the same "pass a sentinel through
    untouched" treatment `_as_video` gets for video.
+12b. `_prepare_audio_references` (present in newer Wan2GP builds; patched
+   only if found) closes a gap the point above doesn't: some builds route
+   every audio reference through this function first, which computes a
+   *shared* 15-second duration budget across all audio sources up front
+   (checking `torch.is_tensor(source)` vs. `sf.info(source).duration`,
+   which crashes on a plain sentinel object -- neither a real waveform nor
+   a file path) and can truncate whichever "waveform" it produces per
+   source if the combined total goes over. A `torch.Tensor` subclass isn't
+   a safe fix here either: the function's own truncation slicing on a real
+   waveform isn't guaranteed to preserve a custom subclass or a `.latent`
+   attribute across the op, which would silently detach the real data from
+   the result. The patch instead mirrors the original function's exact
+   duration/truncation logic, with a dedicated `isinstance`-checked branch
+   for RefMod sentinels that computes duration from (and, if needed,
+   truncates) the real `.latent` tensor's own time axis directly, then
+   re-wraps the result back into a sentinel so `_add_audio_reference`
+   downstream still recognizes it. Every non-sentinel source is delegated
+   to the untouched original per-source logic, unchanged.
 13. `_inject_refmods` itself checks `kwargs.get("window_no")` before doing
    anything else, and skips RefMod injection entirely when it's an int
    greater than 1. Wan2GP's own sliding-window loop (also used by
