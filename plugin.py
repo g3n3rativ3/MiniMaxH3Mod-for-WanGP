@@ -116,23 +116,66 @@ def _diagnose(api_session, model_type, patch_error):
     return "\n".join(lines)
 
 
-def _mod_choices(kind=None):
+ALL_FOLDERS_CHOICE = "(all folders)"
+ROOT_FOLDER_CHOICE = "(main folder only)"
+
+
+def _folder_choices():
+    """Choices for the folder picker above the mod rows: browse everything,
+    just the root, or any one subfolder (recursively discovered, shown as
+    "characters/voices"-style relative paths). Picking "(all folders)" is
+    how you get back to seeing every mod again after narrowing down."""
+    return [ALL_FOLDERS_CHOICE, ROOT_FOLDER_CHOICE] + storage.list_mod_folders()
+
+
+def _mod_choices(kind=None, folder=ALL_FOLDERS_CHOICE):
     """[(none), name, name, ...], optionally restricted to mods of a given
     "image"/"video"/"audio" kind so a slot can only ever offer mods that
-    fit it."""
-    if kind in ("image", "video", "audio"):
-        names = storage.list_refmods_by_kind(kind)
+    fit it, and to a chosen folder. Names are folder-relative paths
+    ("characters/tanya") so they stay unambiguous across subfolders and
+    remain directly usable with storage.load_refmod()."""
+    if folder == ROOT_FOLDER_CHOICE:
+        list_folder, recursive = None, False
+    elif not folder or folder == ALL_FOLDERS_CHOICE:
+        list_folder, recursive = None, True
     else:
-        names = storage.list_refmods()
+        list_folder, recursive = folder, True
+    if kind in ("image", "video", "audio"):
+        names = storage.list_refmods_by_kind(kind, folder=list_folder, recursive=recursive)
+    else:
+        names = storage.list_refmods(folder=list_folder, recursive=recursive)
     return [NONE_CHOICE] + names
 
 
-def _refresh_mod_dropdown_updates():
-    """gr.update(...) for every mod-picker dropdown built by
-    _build_mod_picker_rows, in the same image-then-video-then-audio order."""
-    return ([gr.update(choices=_mod_choices("image")) for _ in range(IMAGE_ROWS)]
-           + [gr.update(choices=_mod_choices("video")) for _ in range(VIDEO_ROWS)]
-           + [gr.update(choices=_mod_choices("audio")) for _ in range(AUDIO_ROWS)])
+def _refresh_mod_dropdown_updates(folder=ALL_FOLDERS_CHOICE, *current_values):
+    """gr.update(...) for the folder picker followed by every mod-picker
+    dropdown built by _build_mod_picker_rows, in the same
+    image-then-video-then-audio order.
+
+    ``current_values`` are those dropdowns' *current* selections, in the
+    same order. Each one is kept selected and force-included in its own
+    choices even when it lives outside the folder now being browsed --
+    otherwise narrowing to a folder would silently drop selections made
+    from other folders (and Gradio would then reject the stale value with
+    "Value: x is not in the list of choices"). That's what makes it
+    possible to browse folder by folder and still combine mods from
+    several different folders in one generation."""
+    def row_update(kind, index):
+        choices = _mod_choices(kind, folder)
+        current = current_values[index] if index < len(current_values) else None
+        if current and current != NONE_CHOICE and current not in choices:
+            choices = choices + [current]
+        return gr.update(choices=choices, value=current if current else NONE_CHOICE)
+
+    updates = [gr.update(choices=_folder_choices(), value=folder)]
+    i = 0
+    for _ in range(IMAGE_ROWS):
+        updates.append(row_update("image", i)); i += 1
+    for _ in range(VIDEO_ROWS):
+        updates.append(row_update("video", i)); i += 1
+    for _ in range(AUDIO_ROWS):
+        updates.append(row_update("audio", i)); i += 1
+    return updates
 
 
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24  # MiniMax H3's own default fps -- only used to turn a
@@ -258,9 +301,30 @@ def _default_model_choice(model_choices):
     return model_choices[0][1] if model_choices else None
 
 
-def _library_rows():
+def _library_rows(folder=None):
+    """Table rows for the Library tab. ``folder`` follows the same picker
+    convention as _mod_choices: None/ALL_FOLDERS_CHOICE lists every mod in
+    every subfolder, ROOT_FOLDER_CHOICE lists only the main folder, and any
+    other value lists that subfolder (and below)."""
+    if folder == ROOT_FOLDER_CHOICE:
+        list_folder, recursive = None, False
+    elif not folder or folder == ALL_FOLDERS_CHOICE:
+        list_folder, recursive = None, True
+    else:
+        list_folder, recursive = folder, True
     return [[i["name"], i["kind"], i["mode"], i["tokens"], i["size_mb"], i["concept_type"], i["description"]]
-            for i in storage.list_refmods_info()]
+            for i in storage.list_refmods_info(folder=list_folder, recursive=recursive)]
+
+
+def _library_mod_names(folder=None):
+    """Just the folder-relative names for the Library's own dropdowns,
+    honouring the same folder filter as _library_rows()."""
+    if folder == ROOT_FOLDER_CHOICE:
+        return storage.list_refmods(folder=None, recursive=False)
+    if not folder or folder == ALL_FOLDERS_CHOICE:
+        return storage.list_refmods(folder=None, recursive=True)
+    return storage.list_refmods(folder=folder, recursive=True)
+
 
 
 def _lora_choices(api_session, model_type):
@@ -278,7 +342,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.28.0"
+        self.version = "0.29.1"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -445,17 +509,23 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     # ── Extract ─────────────────────────────────────────────────────────
 
     def _build_mod_picker_rows(self):
-        """A "Refresh mod list" button + a live reference-budget counter,
-        followed by IMAGE_ROWS image-kind + VIDEO_ROWS video-kind +
-        AUDIO_ROWS audio-kind mod picker rows (dropdown restricted to that
-        kind, plus strength), matching MiniMax H3 Ref2VA's own native
-        reference caps. The refresh button and counter live here (above the
-        rows, for visibility) and are fully wired before returning. Returns
-        the flat list of (dropdown, strength) pairs, image rows first, then
-        video rows, then audio rows -- callers must keep that same order
-        when reading values back (_refresh_mod_dropdown_updates() above
-        does too)."""
-        refresh_btn = gr.Button("🔄 Refresh mod list", size="sm")
+        """A folder picker + "Refresh mod list" button + a live
+        reference-budget counter, followed by IMAGE_ROWS image-kind +
+        VIDEO_ROWS video-kind + AUDIO_ROWS audio-kind mod picker rows
+        (dropdown restricted to that kind, plus strength), matching MiniMax
+        H3 Ref2VA's own native reference caps. The folder picker, refresh
+        button and counter live here (above the rows, for visibility) and
+        are fully wired before returning. Returns the flat list of
+        (dropdown, strength) pairs, image rows first, then video rows, then
+        audio rows -- callers must keep that same order when reading values
+        back (_refresh_mod_dropdown_updates() above does too)."""
+        with gr.Row():
+            folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
+                                    label="Folder", scale=3,
+                                    info="Narrow the mod lists below to one subfolder of "
+                                         "loras/refmods_plugin/minimax_h3/. Pick "
+                                         f"'{ALL_FOLDERS_CHOICE}' to go back to seeing everything.")
+            refresh_btn = gr.Button("🔄 Refresh mod list", size="sm", scale=1)
         counter = gr.Markdown(_format_ref_counter([]))
         mod_rows = []
         gr.Markdown(f"**Image RefMods** (up to {IMAGE_ROWS}; leave a row on `{NONE_CHOICE}` to skip it)")
@@ -479,7 +549,17 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                   label=f"Audio Mod {i + 1}", scale=3)
                 strength = gr.Slider(0.0, 2.0, value=1.0, step=0.01, label="Strength", scale=2)
                 mod_rows.append((mdd, strength))
-        refresh_btn.click(fn=_refresh_mod_dropdown_updates, outputs=[r[0] for r in mod_rows], queue=False)
+
+        picker_outputs = [folder_dd] + [r[0] for r in mod_rows]
+        # The current selections are passed in as well so switching folders
+        # can preserve them (see _refresh_mod_dropdown_updates) -- without
+        # that, narrowing to a folder would drop any mod picked from a
+        # different one and Gradio would reject the now-stale value.
+        picker_inputs = [folder_dd] + [r[0] for r in mod_rows]
+        refresh_btn.click(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
+                          outputs=picker_outputs, queue=False)
+        folder_dd.change(fn=_refresh_mod_dropdown_updates, inputs=picker_inputs,
+                         outputs=picker_outputs, queue=False)
 
         def update_counter(*vals):
             n = len(mod_rows)
@@ -500,7 +580,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     "bar for a few seconds, then **no video is produced on purpose**: the mod file "
                     "is what was created. Check the status line below for confirmation.")
         with gr.Row():
-            name = gr.Textbox(label="Mod name", value="my_concept")
+            name = gr.Textbox(label="Mod name", value="my_concept",
+                              info="A plain name saves to the main folder. Include a path "
+                                   "(characters/tanya) to save into a subfolder instead -- it's "
+                                   "created automatically if it doesn't exist.")
             mode = gr.Radio(label="Mode", choices=["training", "encode"], value="training",
                             info="encode = full fidelity (identical to a live reference), best for a "
                                  "precise face/identity. training = approximate (pooling discards "
@@ -654,13 +737,22 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         gr.Markdown("### Saved RefMods\n"
                     "Mods live in `loras/refmods_plugin/minimax_h3/`. "
                     "Mods produced by the ComfyUI-MiniMaxH3Mod pack use the same file format and "
-                    "can be dropped into that folder directly.")
+                    "can be dropped into that folder directly. **Subfolders are supported** -- "
+                    "make any folder structure you like inside that directory to sort your mods, "
+                    "and use the Folder picker below (here and in the mod pickers) to browse it. "
+                    "Mods in subfolders are named by their relative path (`characters/tanya`).")
+        with gr.Row():
+            library_folder_dd = gr.Dropdown(choices=_folder_choices(), value=ALL_FOLDERS_CHOICE,
+                                            label="Folder", scale=3,
+                                            info=f"Pick '{ALL_FOLDERS_CHOICE}' to go back to "
+                                                 f"seeing every mod again.")
+            refresh_btn = gr.Button("Refresh", scale=1)
         table = gr.Dataframe(
             headers=["name", "kind", "mode", "tokens", "size (MB)", "concept type", "description"],
             value=_library_rows(), interactive=False, wrap=True)
         with gr.Row():
-            refresh_btn = gr.Button("Refresh")
-            delete_name = gr.Textbox(label="Mod name to delete", scale=2)
+            delete_name = gr.Textbox(label="Mod name to delete (include its folder, e.g. characters/tanya)",
+                                     scale=2)
             delete_btn = gr.Button("Delete", variant="stop")
         delete_status = gr.Textbox(label="", interactive=False, show_label=False)
         gr.Markdown(
@@ -668,46 +760,67 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             "wrongly saved as `video` kind if more than one image was stacked together -- the "
             "button below rescans every saved mod's own extraction record and corrects it in "
             "place (the latent data itself is untouched, only the `kind` label). Safe to run "
-            "anytime, including on mods that are already correct.")
+            "anytime, including on mods that are already correct. Covers every subfolder too.")
         with gr.Row():
             fix_btn = gr.Button("Fix classification (image vs video)")
             fix_status = gr.Markdown("")
 
         gr.Markdown(
-            "**Rename or edit a mod's description.** Pick a mod, click Load, edit either field, "
-            "then Save -- the latent data itself is never touched, only the name/description. "
+            "**Rename, move, or edit a mod's description.** Pick a mod, click Load, edit either "
+            "field, then Save -- the latent data itself is never touched, only the "
+            "name/description. Typing a plain name keeps the mod in its current folder; typing a "
+            "path (`characters/tanya`) moves it there, creating the folder if needed, and a "
+            "leading `/` moves it back to the main folder. "
             "Both fields are plain editable text boxes, so you can also just click into either one, "
             "select the text (e.g. double/triple-click, or Ctrl+A), and copy it (Ctrl+C) to reuse "
             "elsewhere -- no separate copy button needed.")
         with gr.Row():
-            edit_name_dd = gr.Dropdown(label="Mod to edit", choices=storage.list_refmods(), scale=2)
+            edit_name_dd = gr.Dropdown(label="Mod to edit", choices=_library_mod_names(), scale=2)
             edit_load_btn = gr.Button("Load")
         with gr.Row():
-            edit_name_field = gr.Textbox(label="Name")
+            edit_name_field = gr.Textbox(label="Name (optionally with a folder path)")
             edit_description_field = gr.Textbox(label="Description", lines=2)
         edit_save_btn = gr.Button("Save changes", variant="primary")
         edit_status = gr.Textbox(label="", interactive=False, show_label=False)
 
         # ── wiring (all components above already exist) ──
-        refresh_btn.click(fn=lambda: (_library_rows(), gr.update(choices=storage.list_refmods())),
-                          outputs=[table, edit_name_dd], queue=False)
+        def _names_keeping(folder, current):
+            """Mod names for the chosen folder, with the currently-selected
+            one force-included even if it lives elsewhere -- otherwise
+            switching folders would leave a stale value Gradio rejects."""
+            names = _library_mod_names(folder)
+            if current and current not in names:
+                names = names + [current]
+            return names
 
-        def do_delete(name):
+        def do_refresh(folder, current):
+            return (_library_rows(folder),
+                    gr.update(choices=_folder_choices(), value=folder),
+                    gr.update(choices=_names_keeping(folder, current), value=current or None))
+
+        refresh_btn.click(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
+                          outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+        library_folder_dd.change(fn=do_refresh, inputs=[library_folder_dd, edit_name_dd],
+                                 outputs=[table, library_folder_dd, edit_name_dd], queue=False)
+
+        def do_delete(name, folder):
             if not name:
-                return _library_rows(), gr.update(choices=storage.list_refmods()), "Enter a mod name first."
+                return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), "Enter a mod name first."
             ok = storage.delete_refmod(name)
-            return (_library_rows(), gr.update(choices=storage.list_refmods()),
+            return (_library_rows(folder), gr.update(choices=_library_mod_names(folder)),
                    (f"Deleted '{name}'." if ok else f"No mod named '{name}' found."))
 
-        delete_btn.click(fn=do_delete, inputs=[delete_name], outputs=[table, edit_name_dd, delete_status], queue=False)
+        delete_btn.click(fn=do_delete, inputs=[delete_name, library_folder_dd],
+                         outputs=[table, edit_name_dd, delete_status], queue=False)
 
-        def do_fix():
+        def do_fix(folder):
             fixed, checked = storage.reclassify_all_mods()
             msg = (f"Checked {checked} mod(s), fixed {fixed}." if fixed else
                   f"Checked {checked} mod(s), all already correctly classified.")
-            return _library_rows(), gr.update(choices=storage.list_refmods()), msg
+            return _library_rows(folder), gr.update(choices=_library_mod_names(folder)), msg
 
-        fix_btn.click(fn=do_fix, outputs=[table, edit_name_dd, fix_status], queue=False)
+        fix_btn.click(fn=do_fix, inputs=[library_folder_dd],
+                      outputs=[table, edit_name_dd, fix_status], queue=False)
 
         def do_load_for_edit(name):
             if not name:
@@ -715,24 +828,30 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             meta = storage.read_refmod_meta(storage.mod_path(name))
             if meta is None:
                 return "", "", f"No mod named '{name}' found."
-            return meta.get("name", name), meta.get("description", "") or "", ""
+            # Show the full folder-relative path, not the metadata's bare
+            # "name" field, so editing it can move the mod (and so a plain
+            # save round-trips without silently relocating anything).
+            return name, meta.get("description", "") or "", ""
 
         edit_load_btn.click(fn=do_load_for_edit, inputs=[edit_name_dd],
                             outputs=[edit_name_field, edit_description_field, edit_status], queue=False)
 
-        def do_save_edit(old_name, new_name, new_description):
+        def do_save_edit(old_name, new_name, new_description, folder):
             if not old_name:
-                return _library_rows(), gr.update(), "Pick a mod first (use Load)."
+                return _library_rows(folder), gr.update(), gr.update(), "Pick a mod first (use Load)."
             try:
                 final_name = storage.rename_and_update_mod(old_name, new_name=new_name,
                                                             new_description=new_description)
             except Exception as e:
-                return _library_rows(), gr.update(), f"Could not save: {e!r}"
+                return _library_rows(folder), gr.update(), gr.update(), f"Could not save: {e!r}"
             msg = f"Saved as '{final_name}'." if final_name != old_name else "Saved."
-            return _library_rows(), gr.update(choices=storage.list_refmods(), value=final_name), msg
+            names = _library_mod_names(folder)
+            return (_library_rows(folder), gr.update(choices=_folder_choices()),
+                    gr.update(choices=names, value=final_name if final_name in names else None), msg)
 
-        edit_save_btn.click(fn=do_save_edit, inputs=[edit_name_dd, edit_name_field, edit_description_field],
-                            outputs=[table, edit_name_dd, edit_status], queue=False)
+        edit_save_btn.click(fn=do_save_edit,
+                            inputs=[edit_name_dd, edit_name_field, edit_description_field, library_folder_dd],
+                            outputs=[table, library_folder_dd, edit_name_dd, edit_status], queue=False)
 
         gr.Markdown(
             "**Build prompt hint.** The `keyword - description` field you set at extraction is "

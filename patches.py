@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import random
 import traceback
 from typing import Optional
@@ -859,7 +860,7 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
     [1, 24, T, H, W]. Audio mods are always full-fidelity ("encode"-only --
     there's no spatial grid to pool for audio, so "training" mode's
     compression concept doesn't apply)."""
-    name = storage._sanitize_name(spec.get("name") or "my_concept")
+    name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
     concept_type = spec.get("concept_type", "generic")
     audio_path = spec.get("audio_path")
     latent_frames = int(spec.get("latent_frames", 16))
@@ -920,7 +921,7 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
               f"({total_t}). Raise 'Max tokens' (Advanced) to keep more of the requested duration.")
 
     mod = core.H3RefMod(
-        name=name, kind="audio", latent=latent, latent_t=total_t, mode="encode",
+        name=storage._split_folder(name)[1], kind="audio", latent=latent, latent_t=total_t, mode="encode",
         source="audio", source_shape=f"{latent.shape[1]}x{latent.shape[2]}x{requested_t}",
         pool=f"full-fidelity (~{duration:.1f}s requested)",
         optimize_steps=0,
@@ -946,7 +947,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
             except Exception:
                 pass
 
-    name = storage._sanitize_name(spec.get("name") or "my_concept")
+    name = storage._sanitize_relpath(spec.get("name") or "my_concept").replace(os.sep, "/")
     mode = core.normalize_mode(spec.get("mode", "training"))
     concept_type = spec.get("concept_type", "generic")
     image_paths = [p for p in (spec.get("image_paths") or []) if p]
@@ -1085,7 +1086,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
                                               # underlying latent has more than one frame.
     px_w, px_h = latent.shape[4] * 16, latent.shape[3] * 16
     mod = core.H3RefMod(
-        name=name, kind=kind, latent=latent, latent_h=latent.shape[3], latent_w=latent.shape[4],
+        name=storage._split_folder(name)[1], kind=kind, latent=latent, latent_h=latent.shape[3], latent_w=latent.shape[4],
         latent_t=total_t, mode=mode,
         source="stack" if len(frames) > 1 else ("video" if n_vid else "image"),
         source_shape=" +".join(source_shapes),

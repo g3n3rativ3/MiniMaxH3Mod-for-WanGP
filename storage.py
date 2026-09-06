@@ -46,7 +46,10 @@ def refmods_dir() -> str:
 
 
 def mod_path(name: str) -> str:
-    return os.path.join(refmods_dir(), _sanitize_name(name))
+    """Absolute path (without the .safetensors extension) for a mod name.
+    ``name`` may be a plain name ("tanya") or a subfolder-relative path
+    ("characters/tanya") -- see _sanitize_relpath for the safety rules."""
+    return os.path.join(refmods_dir(), _sanitize_relpath(name))
 
 
 def _sanitize_name(name: str) -> str:
@@ -55,27 +58,91 @@ def _sanitize_name(name: str) -> str:
     return name or "refmod"
 
 
-def list_refmods() -> List[str]:
-    """Names of every saved mod (without extension), sorted. Reads the
-    metadata header only -- no tensors are loaded."""
-    d = refmods_dir()
-    if not os.path.isdir(d):
+def _sanitize_relpath(name: str) -> str:
+    """Sanitize a possibly-subfoldered mod name ("characters/female/tanya")
+    into a safe relative path. Each path component goes through
+    _sanitize_name (which already strips anything outside
+    alnum/_/-/space), and "." / ".." components are dropped outright, so
+    the result can never escape refmods_dir() no matter what's passed in."""
+    raw = str(name or "").replace("\\", "/")
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part in (".", ".."):
+            continue
+        parts.append(_sanitize_name(part))
+    if not parts:
+        return "refmod"
+    return os.path.join(*parts)
+
+
+def _split_folder(name: str) -> Tuple[str, str]:
+    """("characters/female/tanya") -> ("characters/female", "tanya");
+    a bare name -> ("", name). Always uses "/" for the folder part, which
+    is the separator every UI-facing string in this plugin uses."""
+    rel = _sanitize_relpath(name).replace(os.sep, "/")
+    if "/" not in rel:
+        return "", rel
+    folder, _, leaf = rel.rpartition("/")
+    return folder, leaf
+
+
+def list_mod_folders() -> List[str]:
+    """Every subfolder of refmods_dir() that exists, as "/"-separated
+    relative paths, sorted -- e.g. ["characters", "characters/female",
+    "styles"]. The root folder itself is not included (callers present it
+    separately, since it has no name)."""
+    root = refmods_dir()
+    if not os.path.isdir(root):
+        return []
+    folders = []
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in sorted(dirnames) if not d.startswith(".")]
+        for d in dirnames:
+            rel = os.path.relpath(os.path.join(dirpath, d), root).replace(os.sep, "/")
+            folders.append(rel)
+    return sorted(folders)
+
+
+def list_refmods(folder: Optional[str] = None, recursive: bool = False) -> List[str]:
+    """Names of saved mods (without the .safetensors extension), sorted.
+    Reads nothing but the file listing itself.
+
+    ``folder``: None/"" for the root folder, or a "/"-separated relative
+    subfolder path to list instead. ``recursive``: also include mods in
+    nested subfolders below that point. Returned names are always
+    *relative to refmods_dir()* ("characters/tanya"), never bare leaf
+    names, so they stay directly usable with mod_path()/load_refmod()."""
+    root = refmods_dir()
+    base = root if not folder else os.path.join(root, _sanitize_relpath(folder))
+    if not os.path.isdir(base):
         return []
     names = []
-    for fn in sorted(os.listdir(d)):
-        if fn.lower().endswith(".safetensors"):
-            names.append(fn[:-len(".safetensors")])
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in sorted(dirnames) if not d.startswith(".")]
+            for fn in sorted(filenames):
+                if fn.lower().endswith(".safetensors"):
+                    full = os.path.join(dirpath, fn[:-len(".safetensors")])
+                    names.append(os.path.relpath(full, root).replace(os.sep, "/"))
+    else:
+        for fn in sorted(os.listdir(base)):
+            if fn.lower().endswith(".safetensors"):
+                full = os.path.join(base, fn[:-len(".safetensors")])
+                names.append(os.path.relpath(full, root).replace(os.sep, "/"))
     return names
 
 
-def list_refmods_by_kind(kind: str) -> List[str]:
+def list_refmods_by_kind(kind: str, folder: Optional[str] = None,
+                         recursive: bool = False) -> List[str]:
     """Names (matching list_refmods()/mod_path(), *not* the metadata's own
     "name" field, so they're always safe to pass straight to load_refmod())
-    of saved mods whose kind is "image" or "video". Used to pre-filter the
-    Generate UI's per-kind mod pickers so a slot can only ever be pointed at
-    a mod that actually fits it."""
+    of saved mods whose kind is "image", "video" or "audio". Used to
+    pre-filter the Generate UI's per-kind mod pickers so a slot can only
+    ever be pointed at a mod that actually fits it. ``folder``/``recursive``
+    work exactly as in list_refmods()."""
     out = []
-    for name in list_refmods():
+    for name in list_refmods(folder=folder, recursive=recursive):
         try:
             meta = read_refmod_meta(mod_path(name))
             if meta is not None and meta.get("kind") == kind:
@@ -85,11 +152,14 @@ def list_refmods_by_kind(kind: str) -> List[str]:
     return out
 
 
-def list_refmods_info() -> List[dict]:
+def list_refmods_info(folder: Optional[str] = None, recursive: bool = False) -> List[dict]:
     """[{name, kind, mode, tokens, source, description, concept_type, size_mb}, ...]
-    for the Library tab. Skips files that fail to parse instead of raising."""
+    for the Library tab. Skips files that fail to parse instead of raising.
+    ``name`` is the folder-relative path (what mod_path/load_refmod take),
+    not the metadata's own "name" field, so the Library's own tools can act
+    on the rows it shows."""
     out = []
-    for name in list_refmods():
+    for name in list_refmods(folder=folder, recursive=recursive):
         try:
             meta = read_refmod_meta(mod_path(name))
             if meta is None:
@@ -97,10 +167,13 @@ def list_refmods_info() -> List[dict]:
             latent_h = int(meta.get("latent_h", 0))
             latent_w = int(meta.get("latent_w", 0))
             latent_t = int(meta.get("latent_t", 1))
-            tokens = (latent_h // 2) * (latent_w // 2) * latent_t
+            if meta.get("kind") == "audio":
+                tokens = latent_t * 2  # MINIMAX_H3_AUDIO_CHANNELS -- audio has no spatial grid
+            else:
+                tokens = (latent_h // 2) * (latent_w // 2) * latent_t
             size_mb = os.path.getsize(mod_path(name) + ".safetensors") / (1024 * 1024)
             out.append({
-                "name": meta.get("name", name),
+                "name": name,
                 "kind": meta.get("kind", "?"),
                 "mode": meta.get("mode", "?"),
                 "tokens": tokens,
@@ -112,6 +185,7 @@ def list_refmods_info() -> List[dict]:
         except Exception as e:
             print(f"[H3RefMod] could not read {name}: {e}")
     return out
+
 
 
 def delete_refmod(name: str) -> bool:
@@ -148,8 +222,9 @@ def reclassify_mod(name: str) -> Optional[bool]:
 
 
 def reclassify_all_mods() -> Tuple[int, int]:
-    """Runs reclassify_mod() over every saved mod. Returns (fixed, checked)."""
-    names = list_refmods()
+    """Runs reclassify_mod() over every saved mod, in every subfolder.
+    Returns (fixed, checked)."""
+    names = list_refmods(recursive=True)
     fixed = 0
     for name in names:
         try:
@@ -164,24 +239,39 @@ def rename_and_update_mod(old_name: str, new_name: Optional[str] = None,
                           new_description: Optional[str] = None) -> str:
     """Rename a saved mod and/or update its description in place -- the
     latent data is untouched either way, only metadata changes (and, for a
-    rename, the file name). Returns the mod's final name (same as
-    ``old_name`` if no rename happened, or if the sanitized new name is
-    identical to the old one). Raises ValueError if a mod already exists
-    under the requested new name (never silently overwrites another mod)."""
+    rename, the file name). Returns the mod's final folder-relative name
+    (same as ``old_name`` if no rename happened, or if the sanitized new
+    name is identical to the old one). Raises ValueError if a mod already
+    exists under the requested new name (never silently overwrites another
+    mod).
+
+    ``new_name`` may include a subfolder path ("characters/tanya") to move
+    the mod at the same time; a bare name ("tanya") keeps it in whatever
+    folder it's currently in rather than yanking it back to the root, which
+    is almost never what someone editing a name means."""
     mod = load_refmod(old_name)
-    target_name = _sanitize_name(new_name) if new_name else old_name
+    old_folder, _ = _split_folder(old_name)
+    old_rel = _sanitize_relpath(old_name).replace(os.sep, "/")
+    if new_name:
+        requested = str(new_name).replace("\\", "/")
+        if "/" not in requested and old_folder:
+            requested = f"{old_folder}/{requested}"
+        target_name = _sanitize_relpath(requested).replace(os.sep, "/")
+    else:
+        target_name = old_rel
     if new_description is not None:
         mod.description = new_description
-    if target_name != old_name:
+    if target_name != old_rel:
         if os.path.isfile(mod_path(target_name) + ".safetensors"):
             raise ValueError(f"A mod named '{target_name}' already exists -- pick a different name.")
-        mod.name = target_name
+        mod.name = _split_folder(target_name)[1]
         mod.save(mod_path(target_name))
-        delete_refmod(old_name)
+        delete_refmod(old_rel)
     else:
-        mod.name = old_name
-        mod.save(mod_path(old_name))
+        mod.name = _split_folder(old_rel)[1]
+        mod.save(mod_path(old_rel))
     return target_name
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════

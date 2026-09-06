@@ -259,6 +259,31 @@ Lists every saved mod (name, kind, mode, token count, file size, description)
 read straight from disk. Delete mods you no longer need. Mods live in
 `loras/refmods_plugin/minimax_h3/` at the root of your Wan2GP install.
 
+**Subfolders.** You can organise mods into any folder structure you like
+inside that directory -- `characters/`, `characters/voices/`, `styles/`,
+however deep you want. Every mod picker (this tab, the plugin's own
+Generate tab, and the inline panel on the Media Generator page) has a
+**Folder** dropdown above the rows listing every subfolder found, plus
+`(all folders)` to see everything at once and `(main folder only)` to see
+just the top level -- picking `(all folders)` is how you get back out of a
+subfolder. Mods inside a subfolder are named by their relative path
+(`characters/tanya`), which is what you'd type into the Delete field or use
+anywhere else a mod name is expected.
+
+**Mods from different folders can be combined freely in one generation.**
+The Folder dropdown only changes what the pickers *offer* -- anything
+already selected stays selected and stays listed, even after you browse
+somewhere else. So the normal workflow works: browse to `characters`, pick
+a face, browse to `voices`, pick a voice, and both are still armed when you
+hit Generate.
+
+To put a mod in a subfolder, either drop the `.safetensors` file there
+yourself, type a path into the Extract tab's **Mod name** field
+(`characters/tanya` -- the folder is created automatically), or use the
+rename tool below to move an existing one. Path components are sanitized
+the same way plain names always were, and `..` segments are dropped, so a
+mod can never be written outside the RefMods directory.
+
 **Fix classification.** Mods extracted purely from several still images (no
 video source) were, before this fix, wrongly saved as `video` kind whenever
 more than one image was stacked together into the same mod -- because the
@@ -277,14 +302,19 @@ it's safe to run repeatedly (already-correct mods are left alone). New
 extractions made with this version already classify correctly from the
 start.
 
-**Rename or edit a mod's description.** Pick a mod from the dropdown, click
-**Load** to pull its current name/description into the two text boxes below,
-edit either one, then **Save changes**. Renaming re-saves the file under the
-new name and removes the old one (refused if a mod with that name already
-exists, so you never lose one by accident) -- the latent data is byte-for-byte
-untouched either way. Both fields are plain editable text boxes, so clicking
-into one and selecting the text (double/triple-click, or Ctrl+A) then Ctrl+C
-copies it like any other text on the page -- no separate copy button needed.
+**Rename, move, or edit a mod's description.** Pick a mod from the dropdown,
+click **Load** to pull its current path/description into the two text boxes
+below, edit either one, then **Save changes**. Renaming re-saves the file
+under the new name and removes the old one (refused if a mod with that name
+already exists, so you never lose one by accident) -- the latent data is
+byte-for-byte untouched either way. Typing a plain name keeps the mod in
+whatever folder it's currently in (rather than yanking it back to the main
+folder, which is almost never what editing a name means); typing a path
+(`characters/tanya`) moves it there, creating the folder if needed; and a
+leading `/` moves it back to the main folder. Both fields are plain editable
+text boxes, so clicking into one and selecting the text (double/triple-click,
+or Ctrl+A) then Ctrl+C copies it like any other text on the page -- no
+separate copy button needed.
 
 ### Generate (this plugin's own tab)
 
