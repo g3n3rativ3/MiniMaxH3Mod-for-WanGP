@@ -44,9 +44,17 @@ from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patc
 PlugIn_Name = "MiniMax H3 RefMods"
 PlugIn_Id = "H3RefMods"
 
-IMAGE_ROWS = 9  # matches MiniMax H3 Ref2VA's own native cap on image-kind references
-VIDEO_ROWS = 2  # matches MiniMax H3 Ref2VA's own native cap on video-kind references
-AUDIO_ROWS = 2  # matches MiniMax H3 Ref2VA's own native cap on audio-kind references
+# Row counts are just how many picker slots the UI draws -- they are NOT the
+# model's limits. Wan2GP's own "at most 12 references: 9 images, 2 videos, 2
+# audio" check is bypassed for RefMods (see patches.py's _defer_refmod_ref):
+# those numbers are a UI/product cap, not an architectural one. MiniMax H3
+# uses RoPE positions computed at runtime, an unbounded reference loop, and
+# free-running <Picture N> labels, and the ComfyUI community has verified 15
+# image references working correctly. Raise these if you want more slots --
+# the live counter below will keep telling you what you're actually sending.
+IMAGE_ROWS = 20
+VIDEO_ROWS = 6
+AUDIO_ROWS = 4
 NONE_CHOICE = "(none)"
 
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
@@ -219,6 +227,20 @@ AUDIO_LATENTS_PER_SECOND = 40  # MiniMax H3's own audio VAE: encoder downsamples
                                # an approximation.
 
 
+def _source_file_count(meta, which):
+    """How many source files of a given kind ("img" / "vid") went into a
+    mod, read from the "{n} img, {m} vid" tag every extraction writes.
+    Falls back to 1 when the tag is missing or unparseable (mods from
+    older versions, or hand-made ones), since a mod always came from at
+    least one file."""
+    import re as _re
+    for tag in (meta.get("tags") or []):
+        m = _re.match(r"\s*(\d+)\s*img\s*,\s*(\d+)\s*vid\s*", str(tag))
+        if m:
+            return int(m.group(1) if which == "img" else m.group(2))
+    return 1
+
+
 def _format_ref_counter(row_pairs):
     """A live 'how close to MiniMax H3 Ref2VA's own native reference caps am
     I' readout, from the current (mod_name, strength) values of every
@@ -235,6 +257,8 @@ def _format_ref_counter(row_pairs):
     n_images = 0
     video_latent_frames = 0
     audio_seconds_total = 0.0
+    n_video_files = 0
+    n_audio_files = 0
     for name, strength in row_pairs:
         try:
             strength = float(strength)
@@ -255,23 +279,39 @@ def _format_ref_counter(row_pairs):
         elif kind == "video":
             t_px = (latent_t - 1) * 4 + 1 if latent_t > 1 else 1  # undo the causal 4:1 compression
             video_latent_frames += t_px
+            n_video_files += _source_file_count(meta, "vid")
         else:  # "audio"
             audio_seconds_total += latent_t / AUDIO_LATENTS_PER_SECOND
+            # Audio extraction takes exactly one file per mod, so each
+            # selected audio mod is one source file.
+            n_audio_files += 1
     video_seconds = video_latent_frames / FPS_ASSUMED_FOR_DURATION_ESTIMATE
-    img_mark = "⚠️" if n_images > 9 else "▫️" if n_images == 0 else "✅"
-    vid_mark = "⚠️" if video_seconds > 15 else "▫️" if video_seconds == 0 else "✅"
-    aud_mark = "⚠️" if audio_seconds_total > 15 else "▫️" if audio_seconds_total == 0 else "✅"
-    warn = ""
+    # The 9 / 15s / 15s figures are MiniMax's *documented* reference budget,
+    # which this plugin no longer enforces on RefMods (see patches.py's
+    # _defer_refmod_ref). They stay here purely as a reference point: the
+    # model demonstrably works past them (15 image references verified by
+    # the ComfyUI community), but that is past what MiniMax documents, so
+    # the counter flags it as "beyond documented" rather than as an error.
+    img_mark = "🔶" if n_images > 9 else "▫️" if n_images == 0 else "✅"
+    vid_mark = "🔶" if video_seconds > 15 else "▫️" if video_seconds == 0 else "✅"
+    aud_mark = "🔶" if audio_seconds_total > 15 else "▫️" if audio_seconds_total == 0 else "✅"
+    notes = []
     if n_images > 9:
-        warn += " -- **too many images, generation will fail.** A multi-image mod counts once per image it contains."
+        notes.append(f"{n_images} images is past MiniMax's documented 9 (a multi-image mod counts "
+                     f"once per image it contains). Verified to work up to ~15; expect more VRAM "
+                     f"use and, at some point, attention dilution.")
     if video_seconds > 15:
-        warn += " -- **too much video, generation will fail.**"
+        notes.append("video total is past the documented 15s budget.")
     if audio_seconds_total > 15:
-        warn += " -- **too much audio, generation will fail.**"
-    return (f"{img_mark} **Images: {n_images} / 9**&nbsp;&nbsp;&nbsp;"
-           f"{vid_mark} **Video: ~{video_seconds:.1f}s / 15s** (estimated at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)&nbsp;&nbsp;&nbsp;"
-           f"{aud_mark} **Audio: {audio_seconds_total:.1f}s / 15s**"
-           f"{warn}")
+        notes.append("audio total is past the documented 15s budget.")
+    note = (" -- " + " ".join(notes)) if notes else ""
+    vid_files = f" from {n_video_files} file{'s' if n_video_files != 1 else ''}" if n_video_files else ""
+    aud_files = f" from {n_audio_files} file{'s' if n_audio_files != 1 else ''}" if n_audio_files else ""
+    return (f"{img_mark} **Images: {n_images}** (documented budget: 9)&nbsp;&nbsp;&nbsp;"
+           f"{vid_mark} **Video: ~{video_seconds:.1f}s**{vid_files} "
+           f"(documented: 15s, at {FPS_ASSUMED_FOR_DURATION_ESTIMATE}fps)&nbsp;&nbsp;&nbsp;"
+           f"{aud_mark} **Audio: {audio_seconds_total:.1f}s**{aud_files} (documented: 15s)"
+           f"{note}")
 
 
 def _model_choices(api_session):
@@ -342,7 +382,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.29.1"
+        self.version = "0.30.1"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -591,10 +631,10 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                  "approximation is fine.")
         with gr.Row():
             ref_images = gr.Files(label="Reference image(s)", file_types=["image"], file_count="multiple")
-            ref_video = gr.Video(label="Reference video 1 (optional)")
-            ref_video2 = gr.Video(label="Reference video 2 (optional)")
-        gr.Markdown("*MiniMax H3 Ref2VA natively supports up to two reference videos "
-                   "('Use Two Reference Videos') -- both are encoded and combined into this one mod.*")
+            ref_videos = gr.Files(label="Reference video(s)", file_types=["video"], file_count="multiple")
+        gr.Markdown("*Add as many reference images and videos as you like -- every one is encoded "
+                   "and stacked into this single mod. (Wan2GP's own form is limited to 2 reference "
+                   "videos, but that's a UI cap, not a model one, and it doesn't apply here.)*")
         ref_audio = gr.Audio(label="Reference audio (optional)", type="filepath")
         gr.Markdown("*Audio can't be combined with image/video sources in the same mod (their "
                    "encoded shapes are structurally different) -- providing audio here along "
@@ -678,21 +718,22 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             w.change(fn=update_audio_duration_warning, inputs=[ref_audio, latent_frames],
                     outputs=[audio_duration_warning], queue=False)
 
-        def do_extract(model_type, name, mode, concept_type, ref_images, ref_video, ref_video2, ref_audio,
+        def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                        remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                        identity, multiplier, max_tokens, description, save):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
-            if not image_paths and not ref_video and not ref_video2 and not ref_audio:
+            video_paths = [f.name if hasattr(f, "name") else f for f in (ref_videos or [])]
+            if not image_paths and not video_paths and not ref_audio:
                 return "Add at least one reference image, video, or audio file."
-            if ref_audio and (image_paths or ref_video or ref_video2):
+            if ref_audio and (image_paths or video_paths):
                 return ("Audio can't be combined with image/video sources in the same mod -- "
                        "clear the image/video fields to extract an audio-only mod, or clear "
                        "the audio field to extract an image/video mod.")
             spec = {
                 "name": name, "mode": mode, "concept_type": concept_type,
-                "image_paths": image_paths, "video_path": ref_video, "video_path2": ref_video2,
+                "image_paths": image_paths, "video_paths": video_paths,
                 "audio_path": ref_audio,
                 "remove_background_images_ref": int(remove_background_images_ref or 0),
                 "ref_resolution": int(ref_resolution), "pool_h": int(pool_h), "pool_w": int(pool_w),
@@ -724,7 +765,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
         extract_btn.click(
             fn=do_extract,
-            inputs=[model_dd, name, mode, concept_type, ref_images, ref_video, ref_video2, ref_audio,
+            inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
                    remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
                    identity, multiplier, max_tokens, description, save],
             outputs=[extract_status],

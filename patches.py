@@ -175,6 +175,88 @@ def _log(msg: str) -> None:
     print(f"[H3RefMod] {msg}")
 
 
+_PENDING_ATTR = "_h3refmod_pending_refs"
+
+
+def _pending(pipeline_self):
+    """The per-generation staging area for RefMod references. Holds the
+    live ``refs`` list object once we've seen it, plus the visual/audio
+    entries waiting to be appended to it."""
+    pending = getattr(pipeline_self, _PENDING_ATTR, None)
+    if not isinstance(pending, dict):
+        pending = {"refs": None, "visual": [], "audio": []}
+        setattr(pipeline_self, _PENDING_ATTR, pending)
+    return pending
+
+
+def _remember_refs(pipeline_self, refs) -> None:
+    """Capture the ``refs`` list object generate() is building.
+
+    Called from every patched ``_add_*_reference`` -- including for live,
+    non-RefMod references -- because it's the only place that list is
+    reachable from outside ``generate()``'s own local scope, and we need it
+    to append deferred RefMod entries later. A fresh generate() call builds
+    a new empty list, so a change of identity means a new generation and
+    the staging area is reset."""
+    pending = _pending(pipeline_self)
+    if pending["refs"] is not refs:
+        if pending["refs"] is not None:
+            pending.update({"refs": refs, "visual": [], "audio": []})
+        else:
+            pending["refs"] = refs
+
+
+def _defer_refmod_ref(pipeline_self, stream, latent, ref_entry) -> None:
+    """Stage a RefMod reference instead of appending it immediately.
+
+    ``generate()`` enforces Wan2GP's own reference-count caps ("at most 12
+    references: 9 images, 2 videos, 2 audio clips") *inline*, between the
+    reference-building loop and the point where ``refs`` is actually used
+    (the ``payload`` dict). RefMods injected through the normal
+    ``_add_*_reference`` path would be counted by that check -- capping them
+    at 9/2/2 despite those numbers being a UI/product limit rather than
+    anything the architecture enforces (MiniMax H3's positional encoding is
+    RoPE computed at runtime, its reference loop is unbounded, and its
+    ``<Picture N>`` labels come off a free-running counter; ComfyUI's own
+    cap is likewise a single schema line that the community patches to 15+).
+
+    Staged entries are appended in ``_flush_refmod_refs`` below, called from
+    ``_prepare_condition_rows``, which runs *after* the check and before
+    ``refs`` is read. Live, non-RefMod references are untouched and still
+    counted normally, so the caps continue to apply to them as before."""
+    _pending(pipeline_self)[stream].append((latent, ref_entry))
+
+
+def _flush_refmod_refs(pipeline_self, visual_latents, audio_latents) -> None:
+    """Append everything staged by _defer_refmod_ref, in injection order.
+    Latents and their matching ``refs`` entries go in together so the two
+    stay aligned (the packing code pairs them positionally)."""
+    pending = getattr(pipeline_self, _PENDING_ATTR, None)
+    if not isinstance(pending, dict):
+        return
+    setattr(pipeline_self, _PENDING_ATTR, None)
+    refs = pending["refs"]
+    staged = pending["visual"] + pending["audio"]
+    if not staged:
+        return
+    if refs is None:
+        _log(f"could not place {len(staged)} RefMod reference(s): generate() never exposed its "
+             f"reference list (no reference of any kind reached _add_*_reference). Generation "
+             f"continues without them.")
+        return
+    for latent, entry in pending["visual"]:
+        visual_latents.append(latent)
+        refs.append(entry)
+    for latent, entry in pending["audio"]:
+        audio_latents.append(latent)
+        refs.append(entry)
+    n_img = sum(1 for _, e in pending["visual"] if e["kind"] == "image")
+    n_vid = sum(1 for _, e in pending["visual"] if e["kind"] == "video")
+    n_aud = len(pending["audio"])
+    _log(f"added {n_img} image + {n_vid} video + {n_aud} audio RefMod reference(s) after "
+         f"Wan2GP's reference-count check (RefMods are not subject to its 9/2/2 caps)")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Installation
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,21 +433,23 @@ def install_patches() -> Optional[str]:
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
+        _remember_refs(self, refs)
         if isinstance(image, _RefModImageSentinel):
             latent = image.latent
-            visual_latents.append(latent)
-            refs.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+            _defer_refmod_ref(self, "visual", latent,
+                              {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
             return
         return _orig_add_image_reference(self, image, target_width, target_height,
                                           image_refs_relative_size, presentation, visual_latents, refs)
 
     @functools.wraps(_orig_add_video_reference)
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+        _remember_refs(self, refs)
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
-            visual_latents.append(latent)
-            refs.append({"kind": "video", "latent_t": latent.shape[2],
-                         "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
+            _defer_refmod_ref(self, "visual", latent,
+                              {"kind": "video", "latent_t": latent.shape[2],
+                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
         return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
 
@@ -384,10 +468,11 @@ def install_patches() -> Optional[str]:
 
         @functools.wraps(_orig_add_audio_reference)
         def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs):
+            _remember_refs(self, refs)
             if isinstance(waveform, _RefModAudioSentinel):
                 latent = waveform.latent
-                audio_latents.append(latent)
-                refs.append({"kind": "audio", "ref_audio_t": latent.shape[-1]})
+                _defer_refmod_ref(self, "audio", latent,
+                                  {"kind": "audio", "ref_audio_t": latent.shape[-1]})
                 return
             return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs)
         Pipeline._add_audio_reference = patched_add_audio_reference
@@ -395,6 +480,18 @@ def install_patches() -> Optional[str]:
         _log("could not find _add_audio_reference / _load_audio_reference on MiniMaxH3Pipeline "
              "to patch; audio-kind RefMods will not be available (image and video RefMods are "
              "unaffected). This Wan2GP build may not support direct audio references yet.")
+
+    _orig_prepare_condition_rows = getattr(Pipeline, "_prepare_condition_rows", None)
+    if _orig_prepare_condition_rows is not None:
+        @functools.wraps(_orig_prepare_condition_rows)
+        def patched_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs):
+            _flush_refmod_refs(self, visual_latents, audio_latents)
+            return _orig_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs)
+        Pipeline._prepare_condition_rows = patched_prepare_condition_rows
+    else:
+        _log("no _prepare_condition_rows found on MiniMaxH3Pipeline -- RefMod references will be "
+             "added immediately instead of after Wan2GP's own reference-count check, so the "
+             "native 9-image / 2-video / 2-audio caps will still apply to RefMods on this build.")
 
     _orig_prepare_audio_references = getattr(Pipeline, "_prepare_audio_references", None)
     if _orig_prepare_audio_references is not None:
@@ -783,12 +880,19 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             if "+" not in video_prompt_type:
                 video_prompt_type += "+"
         if remaining:
-            raise ValueError(
-                f"MiniMax H3 RefMod: {len(remaining)} video-kind RefMod(s) could not be placed -- "
-                f"both native reference-video slots (Reference/Control Video 1 and 2) are already "
-                f"used by the current generation settings or by other selected video-kind mods. "
-                f"MiniMax H3 only supports 2 video reference slots in total; deselect a video-kind "
-                f"RefMod, or free a live reference-video slot, to inject it.")
+            # Wan2GP's generate() only reads two video kwargs, so anything
+            # beyond those can't travel through the native path at all.
+            # Stage it directly instead -- it lands in refs/visual_latents
+            # at flush time exactly like the ones that did, just without
+            # passing through _add_video_reference on the way.
+            for sentinel in remaining:
+                latent = sentinel.latent
+                _defer_refmod_ref(pipeline_self, "visual", latent,
+                                  {"kind": "video", "latent_t": latent.shape[2],
+                                   "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
+                                   "ref_audio_t": 0})
+            _log(f"{len(remaining)} video-kind RefMod(s) beyond Wan2GP's two native "
+                 f"reference-video slots injected directly")
         kwargs["video_prompt_type"] = video_prompt_type
 
     if audio_sentinels:
@@ -813,17 +917,19 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 if "B" not in audio_prompt_type:
                     audio_prompt_type += "B"
             if remaining_audio:
-                raise ValueError(
-                    f"MiniMax H3 RefMod: {len(remaining_audio)} audio-kind RefMod(s) could not be "
-                    f"placed -- both native audio-reference slots are already used by the current "
-                    f"generation settings or by other selected audio-kind mods. MiniMax H3 only "
-                    f"supports 2 audio reference slots in total; deselect an audio-kind RefMod to "
-                    f"inject it.")
+                # Same as video above: only two native audio kwargs exist,
+                # so stage the rest directly.
+                for sentinel in remaining_audio:
+                    latent = sentinel.latent
+                    _defer_refmod_ref(pipeline_self, "audio", latent,
+                                      {"kind": "audio", "ref_audio_t": latent.shape[-1]})
+                _log(f"{len(remaining_audio)} audio-kind RefMod(s) beyond Wan2GP's two native "
+                     f"audio-reference slots injected directly")
             kwargs["audio_prompt_type"] = audio_prompt_type
 
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
-         f"{len(audio_sentinels)} audio-kind RefMod reference(s) (video/audio each in their own "
-         f"native reference slot), retention={retention:.2f} (~{total_tokens} tokens)")
+         f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
+         f"retention={retention:.2f} (~{total_tokens} tokens)")
     return kwargs
 
 
@@ -951,7 +1057,12 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     mode = core.normalize_mode(spec.get("mode", "training"))
     concept_type = spec.get("concept_type", "generic")
     image_paths = [p for p in (spec.get("image_paths") or []) if p]
-    video_paths = [p for p in (spec.get("video_path"), spec.get("video_path2")) if p]
+    # "video_paths" is the current, unlimited list form. The older
+    # "video_path"/"video_path2" pair is still accepted so specs saved by
+    # (or queued from) an earlier version keep working unchanged.
+    video_paths = [p for p in (spec.get("video_paths") or []) if p]
+    if not video_paths:
+        video_paths = [p for p in (spec.get("video_path"), spec.get("video_path2")) if p]
     audio_path = spec.get("audio_path") or None
     ref_resolution = int(spec.get("ref_resolution", 1024))
     pool_h = int(spec.get("pool_h", 16))
