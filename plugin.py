@@ -46,7 +46,7 @@ PlugIn_Id = "H3RefMods"
 
 # Row counts are just how many picker slots the UI draws -- they are NOT the
 # model's limits. Wan2GP's own "at most 12 references: 9 images, 2 videos, 2
-# audio" check is bypassed for RefMods (see patches.py's _defer_refmod_ref):
+# audio" check is bypassed for RefMods (see patches.py's _place_refmod_ref):
 # those numbers are a UI/product cap, not an architectural one. MiniMax H3
 # uses RoPE positions computed at runtime, an unbounded reference loop, and
 # free-running <Picture N> labels, and the ComfyUI community has verified 15
@@ -288,7 +288,7 @@ def _format_ref_counter(row_pairs):
     video_seconds = video_latent_frames / FPS_ASSUMED_FOR_DURATION_ESTIMATE
     # The 9 / 15s / 15s figures are MiniMax's *documented* reference budget,
     # which this plugin no longer enforces on RefMods (see patches.py's
-    # _defer_refmod_ref). They stay here purely as a reference point: the
+    # _place_refmod_ref). They stay here purely as a reference point: the
     # model demonstrably works past them (15 image references verified by
     # the ComfyUI community), but that is past what MiniMax documents, so
     # the counter flags it as "beyond documented" rather than as an error.
@@ -382,7 +382,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.30.1"
+        self.version = "0.30.2"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")

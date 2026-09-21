@@ -112,10 +112,11 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent",)
+    __slots__ = ("latent", "hide_ref")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
+        self.hide_ref = False
 
 
 class _RefModVideoSentinel:
@@ -133,10 +134,11 @@ class _RefModVideoSentinel:
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent",)
+    __slots__ = ("latent", "hide_ref")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
+        self.hide_ref = False
 
     @property
     def shape(self):
@@ -165,96 +167,121 @@ class _RefModAudioSentinel:
     ``_prepare_audio_references`` itself to recognize this sentinel by
     ``isinstance`` *before* any of its tensor-vs-path logic runs sidesteps
     both problems -- see install_patches() below."""
-    __slots__ = ("latent",)
+    __slots__ = ("latent", "hide_ref")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
+        self.hide_ref = False
 
 
 def _log(msg: str) -> None:
     print(f"[H3RefMod] {msg}")
 
 
-_PENDING_ATTR = "_h3refmod_pending_refs"
+_STATE_ATTR = "_h3refmod_gen_state"
+
+# Wan2GP's own native reference caps, enforced inline in generate() between
+# the reference-building loop and the point where `refs` is read. They are a
+# UI/product limit, not an architectural one: MiniMax H3 uses RoPE positions
+# computed at runtime, an unbounded reference loop, and free-running
+# <Picture N> labels, and the ComfyUI community verified 15 image refs
+# working. RefMods are kept out of this check -- live references are not.
+_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 2, 2
 
 
-def _pending(pipeline_self):
-    """The per-generation staging area for RefMod references. Holds the
-    live ``refs`` list object once we've seen it, plus the visual/audio
-    entries waiting to be appended to it."""
-    pending = getattr(pipeline_self, _PENDING_ATTR, None)
-    if not isinstance(pending, dict):
-        pending = {"refs": None, "visual": [], "audio": []}
-        setattr(pipeline_self, _PENDING_ATTR, pending)
-    return pending
+def _reset_gen_state(pipeline_self) -> dict:
+    """Fresh per-generate() bookkeeping. Called at the top of every
+    patched generate() call (each sliding window is its own call)."""
+    state = {
+        "phase": 1,               # 1 until the first _prepare_condition_rows, then 2
+        "refs": None,             # phase-1 `refs` list object
+        "refs2": None,            # phase-2 `phase_2_refs` list object
+        "hidden": [],             # [(position_among_visible_refs, entry)] -- phase 1 only
+        "overflow_visual": [],    # [(latent, entry)] video mods past the 2 native kwargs
+        "overflow_audio": [],     # [(latent, entry)] audio mods past the 2 native kwargs
+        "phase2_overflow_done": False,
+    }
+    setattr(pipeline_self, _STATE_ATTR, state)
+    return state
 
 
-def _remember_refs(pipeline_self, refs) -> None:
-    """Capture the ``refs`` list object generate() is building.
-
-    Called from every patched ``_add_*_reference`` -- including for live,
-    non-RefMod references -- because it's the only place that list is
-    reachable from outside ``generate()``'s own local scope, and we need it
-    to append deferred RefMod entries later. A fresh generate() call builds
-    a new empty list, so a change of identity means a new generation and
-    the staging area is reset."""
-    pending = _pending(pipeline_self)
-    if pending["refs"] is not refs:
-        if pending["refs"] is not None:
-            pending.update({"refs": refs, "visual": [], "audio": []})
-        else:
-            pending["refs"] = refs
+def _gen_state(pipeline_self) -> dict:
+    state = getattr(pipeline_self, _STATE_ATTR, None)
+    return state if isinstance(state, dict) else _reset_gen_state(pipeline_self)
 
 
-def _defer_refmod_ref(pipeline_self, stream, latent, ref_entry) -> None:
-    """Stage a RefMod reference instead of appending it immediately.
+def _place_refmod_ref(pipeline_self, sentinel, refs, entry) -> None:
+    """Place one RefMod's `refs` entry. The matching latent has already been
+    appended by the caller, in natural order.
 
-    ``generate()`` enforces Wan2GP's own reference-count caps ("at most 12
-    references: 9 images, 2 videos, 2 audio clips") *inline*, between the
-    reference-building loop and the point where ``refs`` is actually used
-    (the ``payload`` dict). RefMods injected through the normal
-    ``_add_*_reference`` path would be counted by that check -- capping them
-    at 9/2/2 despite those numbers being a UI/product limit rather than
-    anything the architecture enforces (MiniMax H3's positional encoding is
-    RoPE computed at runtime, its reference loop is unbounded, and its
-    ``<Picture N>`` labels come off a free-running counter; ComfyUI's own
-    cap is likewise a single schema line that the community patches to 15+).
+    Phase 1: if this sentinel was marked `hide_ref` by _inject_refmods (it
+    would push Wan2GP's inline cap check over 12/9/2/2), record where it
+    belongs instead of appending -- _restore_hidden_refs puts it back at that
+    exact position right after the check. Everything else is appended now.
 
-    Staged entries are appended in ``_flush_refmod_refs`` below, called from
-    ``_prepare_condition_rows``, which runs *after* the check and before
-    ``refs`` is read. Live, non-RefMod references are untouched and still
-    counted normally, so the caps continue to apply to them as before."""
-    _pending(pipeline_self)[stream].append((latent, ref_entry))
+    Phase 2 (the latent-upscaler refinement pass): always append. There is
+    no cap check there, and phase 2 aligns its refs with phase 1's *by
+    position* (`zip(phase_2_refs, visual_refs)` copies each `kind` across),
+    so both phases must end up in the same natural order -- which is why
+    hidden entries are restored in place rather than appended at the end."""
+    state = _gen_state(pipeline_self)
+    if state["phase"] == 1:
+        state["refs"] = refs
+        if getattr(sentinel, "hide_ref", False):
+            state["hidden"].append((len(refs), entry))
+            return
+    else:
+        state["refs2"] = refs
+    refs.append(entry)
 
 
-def _flush_refmod_refs(pipeline_self, visual_latents, audio_latents) -> None:
-    """Append everything staged by _defer_refmod_ref, in injection order.
-    Latents and their matching ``refs`` entries go in together so the two
-    stay aligned (the packing code pairs them positionally)."""
-    pending = getattr(pipeline_self, _PENDING_ATTR, None)
-    if not isinstance(pending, dict):
-        return
-    setattr(pipeline_self, _PENDING_ATTR, None)
-    refs = pending["refs"]
-    staged = pending["visual"] + pending["audio"]
-    if not staged:
-        return
-    if refs is None:
-        _log(f"could not place {len(staged)} RefMod reference(s): generate() never exposed its "
-             f"reference list (no reference of any kind reached _add_*_reference). Generation "
-             f"continues without them.")
-        return
-    for latent, entry in pending["visual"]:
-        visual_latents.append(latent)
-        refs.append(entry)
-    for latent, entry in pending["audio"]:
-        audio_latents.append(latent)
-        refs.append(entry)
-    n_img = sum(1 for _, e in pending["visual"] if e["kind"] == "image")
-    n_vid = sum(1 for _, e in pending["visual"] if e["kind"] == "video")
-    n_aud = len(pending["audio"])
-    _log(f"added {n_img} image + {n_vid} video + {n_aud} audio RefMod reference(s) after "
-         f"Wan2GP's reference-count check (RefMods are not subject to its 9/2/2 caps)")
+def _note_refs(pipeline_self, refs) -> None:
+    """Remember the refs list object seen by a *live* (non-RefMod) reference
+    too -- needed when every RefMod is overflow and none of them passes
+    through _add_*_reference itself."""
+    state = _gen_state(pipeline_self)
+    state["refs" if state["phase"] == 1 else "refs2"] = refs
+
+
+def _restore_hidden_refs(pipeline_self, visual_latents, audio_latents) -> None:
+    """Called from _prepare_condition_rows. On the first call of a generate()
+    (end of phase 1, just past the cap check), reinsert hidden entries at
+    their original positions and append overflow mods. On a later call
+    (phase 2), append overflow *video* mods once more, since phase 2 only
+    re-adds input_ref_images and the two native video kwargs."""
+    state = _gen_state(pipeline_self)
+    if state["phase"] == 1:
+        state["phase"] = 2
+        refs = state["refs"]
+        pending = len(state["hidden"]) + len(state["overflow_visual"]) + len(state["overflow_audio"])
+        if not pending:
+            return
+        if refs is None:
+            _log(f"could not place {pending} RefMod reference(s): generate() never exposed its "
+                 f"reference list. Generation continues without them.")
+            return
+        # Positions were recorded among *visible* refs; each earlier insertion
+        # shifts later ones by one, hence `+ i`.
+        for i, (pos, entry) in enumerate(state["hidden"]):
+            refs.insert(pos + i, entry)
+        for latent, entry in state["overflow_visual"]:
+            visual_latents.append(latent)
+            refs.append(entry)
+        for latent, entry in state["overflow_audio"]:
+            audio_latents.append(latent)
+            refs.append(entry)
+        if state["hidden"] or state["overflow_visual"] or state["overflow_audio"]:
+            _log(f"placed {len(state['hidden'])} RefMod ref(s) past Wan2GP's 12/9/2/2 reference "
+                 f"check, plus {len(state['overflow_visual'])} video / "
+                 f"{len(state['overflow_audio'])} audio beyond its two native slots each")
+    elif not state["phase2_overflow_done"] and state["overflow_visual"]:
+        state["phase2_overflow_done"] = True
+        refs2 = state["refs2"]
+        if refs2 is None:
+            return
+        for latent, entry in state["overflow_visual"]:
+            visual_latents.append(latent)
+            refs2.append(dict(entry))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -433,24 +460,26 @@ def install_patches() -> Optional[str]:
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
-        _remember_refs(self, refs)
         if isinstance(image, _RefModImageSentinel):
             latent = image.latent
-            _defer_refmod_ref(self, "visual", latent,
+            visual_latents.append(latent)
+            _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
             return
+        _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
                                           image_refs_relative_size, presentation, visual_latents, refs)
 
     @functools.wraps(_orig_add_video_reference)
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
-        _remember_refs(self, refs)
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
-            _defer_refmod_ref(self, "visual", latent,
+            visual_latents.append(latent)
+            _place_refmod_ref(self, video, refs,
                               {"kind": "video", "latent_t": latent.shape[2],
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
+        _note_refs(self, refs)
         return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
 
     if _orig_add_audio_reference is not None and _orig_load_audio_reference is not None:
@@ -468,12 +497,13 @@ def install_patches() -> Optional[str]:
 
         @functools.wraps(_orig_add_audio_reference)
         def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs):
-            _remember_refs(self, refs)
             if isinstance(waveform, _RefModAudioSentinel):
                 latent = waveform.latent
-                _defer_refmod_ref(self, "audio", latent,
+                audio_latents.append(latent)
+                _place_refmod_ref(self, waveform, refs,
                                   {"kind": "audio", "ref_audio_t": latent.shape[-1]})
                 return
+            _note_refs(self, refs)
             return _orig_add_audio_reference(self, waveform, presentation, audio_latents, refs)
         Pipeline._add_audio_reference = patched_add_audio_reference
     else:
@@ -485,7 +515,7 @@ def install_patches() -> Optional[str]:
     if _orig_prepare_condition_rows is not None:
         @functools.wraps(_orig_prepare_condition_rows)
         def patched_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs):
-            _flush_refmod_refs(self, visual_latents, audio_latents)
+            _restore_hidden_refs(self, visual_latents, audio_latents)
             return _orig_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs)
         Pipeline._prepare_condition_rows = patched_prepare_condition_rows
     else:
@@ -534,7 +564,9 @@ def install_patches() -> Optional[str]:
                     if max_duration is not None and own_duration > max_duration:
                         keep_t = max(1, round(max_duration * AUDIO_LATENTS_PER_SECOND))
                         latent = latent[..., :keep_t]
-                    waveforms.append(_RefModAudioSentinel(latent))
+                    rewrapped = _RefModAudioSentinel(latent)
+                    rewrapped.hide_ref = getattr(source, "hide_ref", False)  # keep the cap-check decision
+                    waveforms.append(rewrapped)
                     continue
                 if torch.is_tensor(source):
                     waveform = source
@@ -608,6 +640,10 @@ def install_patches() -> Optional[str]:
                     except Exception:
                         pass
             return None  # graceful no-output outcome, same as a user-initiated abort
+
+        # Fresh bookkeeping for this call -- every generate() (and every
+        # sliding window, each of which is its own call) starts at phase 1.
+        _reset_gen_state(self)
 
         state_json = custom_settings.get(SETTING_GENERATE)
         if state_json:
@@ -862,47 +898,56 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     if not image_sentinels and not video_sentinels and not audio_sentinels:
         return kwargs
 
+    state = _gen_state(pipeline_self)
+
+    # Live (non-RefMod) references already in this generation -- they still
+    # count against Wan2GP's inline 12/9/2/2 check, so RefMods get whatever
+    # room is left before we start hiding them from it.
+    video_prompt_type = str(kwargs.get("video_prompt_type") or "")
+    audio_prompt_type = str(kwargs.get("audio_prompt_type") or "")
+    live_img = len(kwargs.get("input_ref_images") or [])
+    live_vid = ((kwargs.get("input_frames") is not None and "V" in video_prompt_type)
+                + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type))
+    live_aud = ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
+                + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type))
+
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
         kwargs["input_ref_images"] = list(existing) + image_sentinels
 
+    native_videos = []
     if video_sentinels:
-        video_prompt_type = str(kwargs.get("video_prompt_type") or "")
         remaining = list(video_sentinels)
         if remaining and kwargs.get("input_frames") is None:
             kwargs["input_frames"] = remaining.pop(0)
+            native_videos.append(kwargs["input_frames"])
             if "V" not in video_prompt_type:
                 video_prompt_type += "V"
         if remaining and kwargs.get("input_frames2") is None:
             kwargs["input_frames2"] = remaining.pop(0)
+            native_videos.append(kwargs["input_frames2"])
             if "V" not in video_prompt_type:
                 video_prompt_type += "V"
             if "+" not in video_prompt_type:
                 video_prompt_type += "+"
+        # Wan2GP's generate() only reads two video kwargs; the rest are added
+        # straight into refs/visual_latents after the cap check instead.
+        for sentinel in remaining:
+            latent = sentinel.latent
+            state["overflow_visual"].append((latent, {
+                "kind": "video", "latent_t": latent.shape[2],
+                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0}))
         if remaining:
-            # Wan2GP's generate() only reads two video kwargs, so anything
-            # beyond those can't travel through the native path at all.
-            # Stage it directly instead -- it lands in refs/visual_latents
-            # at flush time exactly like the ones that did, just without
-            # passing through _add_video_reference on the way.
-            for sentinel in remaining:
-                latent = sentinel.latent
-                _defer_refmod_ref(pipeline_self, "visual", latent,
-                                  {"kind": "video", "latent_t": latent.shape[2],
-                                   "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
-                                   "ref_audio_t": 0})
             _log(f"{len(remaining)} video-kind RefMod(s) beyond Wan2GP's two native "
-                 f"reference-video slots injected directly")
+                 f"reference-video slots will be added directly")
         kwargs["video_prompt_type"] = video_prompt_type
 
+    native_audios = []
     if audio_sentinels:
-        audio_prompt_type = str(kwargs.get("audio_prompt_type") or "")
         if "K" in audio_prompt_type:
             # "Use reference-video soundtrack(s)" (K) reads audio_guide/audio_guide2
-            # as the soundtrack for the reference video(s) in those same two
-            # kwargs -- the exact slots audio-kind RefMods need. The two
-            # features can't share them; skip rather than silently overwrite
-            # (and break) whatever soundtrack the user configured.
+            # as the soundtrack for the reference video(s) -- the exact slots
+            # audio-kind RefMods need. Skip rather than silently overwrite it.
             _log(f"skipped {len(audio_sentinels)} audio-kind RefMod(s) -- 'Use reference-video "
                  f"soundtrack(s)' is already using the audio reference slots for this generation. "
                  f"Turn that off to use audio-kind RefMods instead.")
@@ -910,22 +955,45 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             remaining_audio = list(audio_sentinels)
             if remaining_audio and kwargs.get("audio_guide") is None:
                 kwargs["audio_guide"] = remaining_audio.pop(0)
+                native_audios.append(kwargs["audio_guide"])
                 if "A" not in audio_prompt_type:
                     audio_prompt_type += "A"
             if remaining_audio and kwargs.get("audio_guide2") is None:
                 kwargs["audio_guide2"] = remaining_audio.pop(0)
+                native_audios.append(kwargs["audio_guide2"])
                 if "B" not in audio_prompt_type:
                     audio_prompt_type += "B"
+            for sentinel in remaining_audio:
+                latent = sentinel.latent
+                state["overflow_audio"].append((latent, {"kind": "audio", "ref_audio_t": latent.shape[-1]}))
             if remaining_audio:
-                # Same as video above: only two native audio kwargs exist,
-                # so stage the rest directly.
-                for sentinel in remaining_audio:
-                    latent = sentinel.latent
-                    _defer_refmod_ref(pipeline_self, "audio", latent,
-                                      {"kind": "audio", "ref_audio_t": latent.shape[-1]})
                 _log(f"{len(remaining_audio)} audio-kind RefMod(s) beyond Wan2GP's two native "
-                     f"audio-reference slots injected directly")
+                     f"audio-reference slots will be added directly")
             kwargs["audio_prompt_type"] = audio_prompt_type
+
+    # Decide which RefMods stay visible to Wan2GP's inline cap check and
+    # which get hidden from it (and restored in place right after). Visible
+    # as many as fit -- that keeps the separate "at least as many visual as
+    # audio references" check satisfied whenever a live audio clip relies on
+    # RefMod visuals -- in the same order generate() will process them.
+    room_total = _NATIVE_CAP_TOTAL - (live_img + live_vid + live_aud)
+    room = {"image": _NATIVE_CAP_IMAGE - live_img, "video": _NATIVE_CAP_VIDEO - live_vid,
+            "audio": _NATIVE_CAP_AUDIO - live_aud}
+    visible_visual = live_img + live_vid
+    visible_audio = live_aud
+    for kind, sentinels in (("image", image_sentinels), ("video", native_videos), ("audio", native_audios)):
+        for sentinel in sentinels:
+            fits = room_total > 0 and room[kind] > 0
+            if kind == "audio":
+                fits = fits and visible_audio + 1 <= visible_visual
+            sentinel.hide_ref = not fits
+            if fits:
+                room_total -= 1
+                room[kind] -= 1
+                if kind == "audio":
+                    visible_audio += 1
+                else:
+                    visible_visual += 1
 
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "

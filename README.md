@@ -562,6 +562,25 @@ load time:
    window boundary in the output. A plain, single-window generation never
    sets `window_no` above 1 either, so this never affects normal use.
 
+14. `_prepare_condition_rows` is wrapped to lift Wan2GP's own reference
+   caps for RefMods. `generate()` enforces "at most 12 references: 9
+   images, 2 videos, 2 audio clips" *inline*, between building the
+   reference list and using it -- a UI/product limit, not an architectural
+   one (MiniMax H3 uses runtime-computed RoPE positions, an unbounded
+   reference loop, and free-running `<Picture N>` labels; the ComfyUI
+   community has verified 15 image references working). RefMod latents are
+   always appended immediately, in natural order. Only the `refs` entries
+   of RefMods that would push the check over its limits are held back from
+   it, then reinserted **at their original positions** from
+   `_prepare_condition_rows`, which runs right after the check. Keeping
+   natural order matters: the latent-upscaler refinement pass (phase 2)
+   re-adds references into fresh lists and aligns them with phase 1's by
+   position. As many RefMods as fit stay visible to the check, so the
+   separate "at least as many visual as audio references" rule still holds
+   when a live audio clip relies on RefMod visuals. Video/audio RefMods
+   beyond Wan2GP's two native kwargs each are added directly, in both
+   phases. Live (non-RefMod) references are still counted normally.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.
