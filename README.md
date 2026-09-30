@@ -581,6 +581,22 @@ load time:
    beyond Wan2GP's two native kwargs each are added directly, in both
    phases. Live (non-RefMod) references are still counted normally.
 
+15. Newer Wan2GP builds expose a **third** native reference-video slot
+   (`input_frames3`, flag `*`) and a third audio one (`audio_guide3`, flag
+   `D`), and raised their own caps to 9 images / 3 videos / 3 audio. The
+   plugin detects which of these kwargs `generate()` actually accepts and
+   fills them before falling back to direct injection, so it works on
+   builds with either two or three native slots.
+16. Those builds also share a 15-second budget between reference videos by
+   trimming them (`video[:, :max_frames]`, when `-` is in
+   `video_prompt_type` -- a flag older settings get migrated to
+   automatically). A RefMod carries a latent, not pixels, so the video
+   sentinel implements that one slicing form: the pixel-frame count is
+   converted back to latent frames (undoing the causal 4:1 temporal
+   compression) and a trimmed sentinel is returned. Without it, two or more
+   long video RefMods raise "'_RefModVideoSentinel' object is not
+   subscriptable".
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.

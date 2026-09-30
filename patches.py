@@ -148,6 +148,28 @@ class _RefModVideoSentinel:
         w_px = self.latent.shape[4] * 16
         return (3, t_px, h_px, w_px)
 
+    def __getitem__(self, key):
+        """Support the one slicing shape Wan2GP applies to reference videos:
+        ``video[:, :max_frames]``, used to share the 15s reference budget
+        between several reference videos (only when "-" is in
+        video_prompt_type). A RefMod carries a latent rather than pixels, so
+        the pixel-frame count is converted back to latent frames -- undoing
+        the video VAE's causal 4:1 temporal compression -- and a trimmed
+        sentinel is returned. Any other indexing is refused loudly rather
+        than silently returning something wrong."""
+        if (isinstance(key, tuple) and len(key) == 2 and key[0] == slice(None)
+                and isinstance(key[1], slice) and key[1].start in (None, 0) and key[1].step is None):
+            stop_px = key[1].stop
+            if stop_px is None:
+                return self
+            keep_t = max(1, (int(stop_px) - 1) // 4 + 1)
+            if keep_t >= self.latent.shape[2]:
+                return self
+            trimmed = _RefModVideoSentinel(self.latent[:, :, :keep_t])
+            trimmed.hide_ref = self.hide_ref
+            return trimmed
+        raise TypeError(f"_RefModVideoSentinel supports only [:, :n] slicing, got {key!r}")
+
 
 class _RefModAudioSentinel:
     """Stands in for an audio-kind reference. Carries an already-encoded,
@@ -178,6 +200,15 @@ def _log(msg: str) -> None:
     print(f"[H3RefMod] {msg}")
 
 
+# Which reference kwargs this Wan2GP build's generate() actually accepts.
+# Older builds expose two native reference-video slots (input_frames,
+# input_frames2) and two audio ones (audio_guide, audio_guide2); newer ones
+# add a third of each (input_frames3 / "*", audio_guide3 / "D"). Filled in by
+# install_patches() so injection uses whatever exists and falls back to
+# direct injection for the rest.
+_generate_params = set()
+
+
 _STATE_ATTR = "_h3refmod_gen_state"
 
 # Wan2GP's own native reference caps, enforced inline in generate() between
@@ -186,7 +217,7 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # computed at runtime, an unbounded reference loop, and free-running
 # <Picture N> labels, and the ComfyUI community verified 15 image refs
 # working. RefMods are kept out of this check -- live references are not.
-_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 2, 2
+_NATIVE_CAP_TOTAL, _NATIVE_CAP_IMAGE, _NATIVE_CAP_VIDEO, _NATIVE_CAP_AUDIO = 12, 9, 3, 3
 
 
 def _reset_gen_state(pipeline_self) -> dict:
@@ -455,6 +486,12 @@ def install_patches() -> Optional[str]:
     _orig_add_audio_reference = getattr(Pipeline, "_add_audio_reference", None)
     _orig_load_audio_reference = getattr(Pipeline, "_load_audio_reference", None)
     _orig_generate = Pipeline.generate
+    try:
+        import inspect as _inspect
+        _generate_params.clear()
+        _generate_params.update(_inspect.signature(_orig_generate).parameters)
+    except Exception:
+        pass
     _orig_as_video = getattr(h3_pipeline, "_as_video", None)
 
     @functools.wraps(_orig_add_image_reference)
@@ -907,9 +944,11 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     audio_prompt_type = str(kwargs.get("audio_prompt_type") or "")
     live_img = len(kwargs.get("input_ref_images") or [])
     live_vid = ((kwargs.get("input_frames") is not None and "V" in video_prompt_type)
-                + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type))
+                + (kwargs.get("input_frames2") is not None and "+" in video_prompt_type)
+                + (kwargs.get("input_frames3") is not None and "*" in video_prompt_type))
     live_aud = ((kwargs.get("audio_guide") is not None and "A" in audio_prompt_type)
-                + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type))
+                + (kwargs.get("audio_guide2") is not None and "B" in audio_prompt_type)
+                + (kwargs.get("audio_guide3") is not None and "D" in audio_prompt_type))
 
     if image_sentinels:
         existing = kwargs.get("input_ref_images") or []
@@ -930,6 +969,18 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 video_prompt_type += "V"
             if "+" not in video_prompt_type:
                 video_prompt_type += "+"
+        # Newer Wan2GP builds expose a third native reference-video slot
+        # (input_frames3, enabled by "*"). Use it when it exists, so a third
+        # video RefMod travels the native path -- including through the
+        # phase-2 refinement pass, which re-reads video_sources -- instead of
+        # being appended directly.
+        if remaining and "input_frames3" in _generate_params and kwargs.get("input_frames3") is None:
+            kwargs["input_frames3"] = remaining.pop(0)
+            native_videos.append(kwargs["input_frames3"])
+            if "V" not in video_prompt_type:
+                video_prompt_type += "V"
+            if "*" not in video_prompt_type:
+                video_prompt_type += "*"
         # Wan2GP's generate() only reads two video kwargs; the rest are added
         # straight into refs/visual_latents after the cap check instead.
         for sentinel in remaining:
@@ -963,6 +1014,12 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 native_audios.append(kwargs["audio_guide2"])
                 if "B" not in audio_prompt_type:
                     audio_prompt_type += "B"
+            # Third native audio slot on newer builds (audio_guide3, flag "D").
+            if remaining_audio and "audio_guide3" in _generate_params and kwargs.get("audio_guide3") is None:
+                kwargs["audio_guide3"] = remaining_audio.pop(0)
+                native_audios.append(kwargs["audio_guide3"])
+                if "D" not in audio_prompt_type:
+                    audio_prompt_type += "D"
             for sentinel in remaining_audio:
                 latent = sentinel.latent
                 state["overflow_audio"].append((latent, {"kind": "audio", "ref_audio_t": latent.shape[-1]}))
