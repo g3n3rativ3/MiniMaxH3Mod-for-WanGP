@@ -63,7 +63,9 @@ import torch
 from . import core, storage
 
 SETTING_GENERATE = "h3_refmod_state"     # custom_settings key: mods to inject into a real render
-SETTING_EXTRACT = "h3_refmod_extract"    # custom_settings key: "run an extraction, not a render"
+SETTING_EXTRACT = "h3_refmod_extract"    # legacy custom_settings key, still read for queued tasks
+EXTRACT_WRAPPER_KEY = "__h3refmod_extract__"  # extraction spec carried inside SETTING_GENERATE
+_CUSTOM_SETTINGS_MAX_GUESS = 5           # Wan2GP's own CUSTOM_SETTINGS_MAX, for the warning below
 STASH_KEY = "_h3refmod_selection"        # key inside the session `state` dict for the inline panel
 FPS_ASSUMED_FOR_DURATION_ESTIMATE = 24   # matches plugin.py's own constant of the same name --
                                          # MiniMax H3's own default fps, used only to turn a
@@ -396,12 +398,17 @@ def _install_model_def_patch() -> None:
 
     _orig_query_model_def = FamilyHandler.query_model_def
 
+    # ONE declared slot, not two. Wan2GP keeps only the first
+    # CUSTOM_SETTINGS_MAX (5) custom settings of a model
+    # (get_model_custom_settings truncates with `custom_settings[:MAX]`), and
+    # MiniMax H3 Ref2VA now declares four of its own (Mask Denoising Mode,
+    # Audio Refinement, plus the two excerpt-position settings). Declaring two
+    # here made six, so the last one -- the extraction job -- was silently
+    # dropped and an extraction ran as an ordinary generation instead.
+    # Extraction jobs now travel inside this same slot (see EXTRACT_WRAPPER_KEY).
     extra_settings = [
         {"id": SETTING_GENERATE, "name": "H3RefModState",
          "label": "RefMods selection (managed by the MiniMax H3 RefMods plugin -- leave blank)",
-         "type": "text", "default": ""},
-        {"id": SETTING_EXTRACT, "name": "H3RefModExtract",
-         "label": "RefMod extraction job (managed by the MiniMax H3 RefMods plugin -- leave blank)",
          "type": "text", "default": ""},
     ]
 
@@ -412,12 +419,20 @@ def _install_model_def_patch() -> None:
             existing = result.get("custom_settings")
             existing = list(existing) if isinstance(existing, list) else []
             existing_ids = {e.get("id") for e in existing if isinstance(e, dict)}
-            result["custom_settings"] = existing + [s for s in extra_settings if s["id"] not in existing_ids]
+            merged = existing + [s for s in extra_settings if s["id"] not in existing_ids]
+            result["custom_settings"] = merged
+            # Loud warning rather than another silent drop if Wan2GP ever
+            # declares enough of its own settings to push ours past the cap.
+            if len(merged) > _CUSTOM_SETTINGS_MAX_GUESS and not getattr(patched_query_model_def, "_warned", False):
+                patched_query_model_def._warned = True
+                _log(f"warning: this model declares {len(merged)} custom settings and Wan2GP keeps "
+                     f"only the first {_CUSTOM_SETTINGS_MAX_GUESS}; RefMods may be ignored. "
+                     f"Please report this -- the plugin needs to claim its slot differently.")
         return result
 
     FamilyHandler.query_model_def = patched_query_model_def
     setattr(FamilyHandler, _MODEL_DEF_PATCH_MARKER, True)
-    _log("declared h3_refmod_state / h3_refmod_extract custom settings on MiniMax H3's model definition")
+    _log("declared the h3_refmod_state custom setting on MiniMax H3's model definition")
 
     if getattr(FamilyHandler, _VALIDATE_PATCH_MARKER, False):
         return
@@ -664,7 +679,17 @@ def install_patches() -> Optional[str]:
         custom_settings = kwargs.get("custom_settings")
         custom_settings = custom_settings if isinstance(custom_settings, dict) else {}
 
-        extract_job = custom_settings.get(SETTING_EXTRACT)
+        extract_job = custom_settings.get(SETTING_EXTRACT)  # legacy two-slot form
+        state_json = custom_settings.get(SETTING_GENERATE)
+        if not extract_job and state_json:
+            # Current form: the extraction spec rides inside the generate slot.
+            try:
+                parsed = json.loads(state_json) if isinstance(state_json, str) else state_json
+                if isinstance(parsed, dict) and EXTRACT_WRAPPER_KEY in parsed:
+                    extract_job = parsed[EXTRACT_WRAPPER_KEY]
+                    state_json = None
+            except Exception:
+                pass
         if extract_job:
             set_progress_status = kwargs.get("set_progress_status")
             try:
@@ -682,7 +707,8 @@ def install_patches() -> Optional[str]:
         # sliding window, each of which is its own call) starts at phase 1.
         _reset_gen_state(self)
 
-        state_json = custom_settings.get(SETTING_GENERATE)
+        # state_json was already read (and cleared if it turned out to carry an
+        # extraction job) at the top of this function -- don't re-read it here.
         if state_json:
             try:
                 kwargs = _inject_refmods(self, kwargs, state_json)
@@ -859,6 +885,8 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     except Exception as e:
         _log(f"could not parse RefMod state ({e!r}); ignoring")
         return kwargs
+    if EXTRACT_WRAPPER_KEY in state:
+        return kwargs  # an extraction spec, not a mod selection (already handled upstream)
     rows = state.get("rows") or []
     if not rows:
         return kwargs

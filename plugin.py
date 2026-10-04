@@ -37,7 +37,7 @@ import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
 
 from . import core, storage
-from .patches import (SETTING_EXTRACT, SETTING_GENERATE, STASH_KEY, install_patches,
+from .patches import (EXTRACT_WRAPPER_KEY, SETTING_GENERATE, STASH_KEY, install_patches,
                       install_get_model_settings_patch, install_prepare_inputs_dict_patch,
                       is_minimax_h3_ref2va)
 
@@ -95,7 +95,7 @@ def _diagnose(api_session, model_type, patch_error):
     try:
         model_def = api_session.get_model_def(model_type) or {}
         declared_ids = {s.get("id") for s in (model_def.get("custom_settings") or []) if isinstance(s, dict)}
-        missing = [sid for sid in (SETTING_GENERATE, SETTING_EXTRACT) if sid not in declared_ids]
+        missing = [sid for sid in (SETTING_GENERATE,) if sid not in declared_ids]
         if missing:
             lines.append(f"❌ This model does NOT declare {missing} under custom_settings -- RefMods will "
                          f"silently no-op for it (a real generation will run instead of an extraction, or "
@@ -382,7 +382,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.31.0"
+        self.version = "0.32.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -753,7 +753,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
 
             try:
                 self._submit(api_session, model_type,
-                            {"video_length": 107, "custom_settings": {SETTING_EXTRACT: json.dumps(spec)}},
+                            {"video_length": 107,
+                             # Rides inside the single declared slot: Wan2GP keeps only the
+                             # first 5 custom settings per model and MiniMax H3 now declares
+                             # 4 of its own, so a second slot of ours would be dropped.
+                             "custom_settings": {SETTING_GENERATE: json.dumps({EXTRACT_WRAPPER_KEY: spec})}},
                             ExtractCallbacks())
             except Exception as e:
                 return f"Extraction task failed to run: {e!r}"

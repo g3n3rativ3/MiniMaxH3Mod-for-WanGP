@@ -597,6 +597,19 @@ load time:
    long video RefMods raise "'_RefModVideoSentinel' object is not
    subscriptable".
 
+17. The plugin declares **one** custom setting (`h3_refmod_state`), not two.
+   Wan2GP keeps only the first `CUSTOM_SETTINGS_MAX` (5) custom settings a
+   model declares -- `get_model_custom_settings` truncates with
+   `custom_settings[:MAX]` -- and MiniMax H3 Ref2VA now declares four of its
+   own (Mask Denoising Mode, Audio Refinement, and the two excerpt-position
+   settings). A second slot would be the sixth and get dropped silently,
+   which is what made RefMod *extraction* run as an ordinary generation.
+   Extraction jobs therefore travel inside that same slot, wrapped under an
+   `__h3refmod_extract__` key; the old two-slot form is still read so tasks
+   queued by an earlier version keep working. If a future Wan2GP build
+   declares enough settings to squeeze the slot out anyway, the plugin says
+   so loudly in the console instead of failing silently.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.
