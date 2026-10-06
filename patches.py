@@ -518,12 +518,40 @@ def install_patches() -> Optional[str]:
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
             return
+        if isinstance(image, _RefModVideoSentinel):
+            # A video-kind RefMod arriving on the *image* reference path. This
+            # plugin never puts one there -- something else moved it, e.g. the
+            # MiniMax H3 Image Mode plugin, which folds reference videos into
+            # reference images for single-frame (text-to-image) output, where a
+            # moving reference has no meaning. Passing it through to the
+            # original would crash in _to_pil ("int() argument must be ... not
+            # '_RefModVideoSentinel'"), so use the clip's first frame as a
+            # still image reference instead -- a valid single-frame latent, and
+            # the closest thing to what was asked for.
+            latent = image.latent[:, :, :1]
+            visual_latents.append(latent)
+            _place_refmod_ref(self, image, refs,
+                              {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+            if not getattr(patched_add_image_reference, "_warned_video_as_image", False):
+                patched_add_image_reference._warned_video_as_image = True
+                _log("a video-kind RefMod was handed to the image-reference path (image/"
+                     "single-frame output mode); using its first frame as a still reference.")
+            return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
                                           image_refs_relative_size, presentation, visual_latents, refs)
 
     @functools.wraps(_orig_add_video_reference)
     def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+        if isinstance(video, _RefModImageSentinel):
+            # Symmetric guard: a still RefMod on the video path is simply a
+            # one-frame clip, which is a valid video latent.
+            latent = video.latent
+            visual_latents.append(latent)
+            _place_refmod_ref(self, video, refs,
+                              {"kind": "video", "latent_t": latent.shape[2],
+                               "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
+            return
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
             visual_latents.append(latent)

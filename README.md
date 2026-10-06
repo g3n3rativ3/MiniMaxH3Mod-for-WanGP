@@ -610,6 +610,16 @@ load time:
    declares enough settings to squeeze the slot out anyway, the plugin says
    so loudly in the console instead of failing silently.
 
+18. `_add_image_reference` also tolerates a **video**-kind RefMod being
+   handed to it, and `_add_video_reference` an image-kind one. This plugin
+   never routes them that way, but another plugin can: MiniMax H3 Image
+   Mode folds reference videos into reference images for single-frame
+   (text-to-image) output, where a moving reference has no meaning. The
+   native image path would then crash in `_to_pil`
+   ("int() argument must be ... not '_RefModVideoSentinel'"), so the clip's
+   first frame is used as a still reference instead (logged once), and a
+   still on the video path is treated as the one-frame clip it already is.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.
