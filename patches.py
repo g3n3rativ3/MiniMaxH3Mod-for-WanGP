@@ -114,11 +114,12 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 class _RefModImageSentinel:
     """Stands in for a single-frame ("image kind") reference. Carries an
     already-encoded, already-weighted VAE latent [1, 24, 1, H, W]."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "enc")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
         self.hide_ref = False
+        self.enc = None   # presentation payload: dict or None
 
 
 class _RefModVideoSentinel:
@@ -136,11 +137,12 @@ class _RefModVideoSentinel:
     [C, T, H, W] shape derived from the latent's own dims (undoing the video
     VAE's causal 4:1 temporal compression and 16x spatial downsampling), not
     real pixel data (there is none for a RefMod)."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "enc")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
         self.hide_ref = False
+        self.enc = None   # presentation payload: dict or None
 
     @property
     def shape(self):
@@ -191,11 +193,12 @@ class _RefModAudioSentinel:
     ``_prepare_audio_references`` itself to recognize this sentinel by
     ``isinstance`` *before* any of its tensor-vs-path logic runs sidesteps
     both problems -- see install_patches() below."""
-    __slots__ = ("latent", "hide_ref")
+    __slots__ = ("latent", "hide_ref", "enc")
 
     def __init__(self, latent: torch.Tensor):
         self.latent = latent
         self.hide_ref = False
+        self.enc = None   # presentation payload: dict or None
 
 
 def _log(msg: str) -> None:
@@ -212,6 +215,12 @@ _generate_params = set()
 
 
 _STATE_ATTR = "_h3refmod_gen_state"
+
+# The pipeline currently inside generate(). _resize_video is a module-level
+# helper with no `self`, so this is how the video path reaches that call's
+# bookkeeping. Generation is single-threaded per pipeline, so one slot is
+# enough; it is only ever read, never trusted to exist.
+_ACTIVE = {"pipeline": None}
 
 # Wan2GP's own native reference caps, enforced inline in generate() between
 # the reference-building loop and the point where `refs` is read. They are a
@@ -513,7 +522,10 @@ def install_patches() -> Optional[str]:
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
         if isinstance(image, _RefModImageSentinel):
-            latent = image.latent
+            latent = (_fit_latent_to_canvas(image.latent, target_width, target_height,
+                                            image_refs_relative_size, "image RefMod")
+                      if _should_fit(self, target_width, target_height) else image.latent)
+            _present_refmod(presentation, image)
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
@@ -528,7 +540,10 @@ def install_patches() -> Optional[str]:
             # '_RefModVideoSentinel'"), so use the clip's first frame as a
             # still image reference instead -- a valid single-frame latent, and
             # the closest thing to what was asked for.
-            latent = image.latent[:, :, :1]
+            latent = (_fit_latent_to_canvas(image.latent[:, :, :1], target_width, target_height,
+                                            image_refs_relative_size, "video RefMod (as still)")
+                      if _should_fit(self, target_width, target_height) else image.latent[:, :, :1])
+            _present_refmod(presentation, image)
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
                               {"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
@@ -547,6 +562,7 @@ def install_patches() -> Optional[str]:
             # Symmetric guard: a still RefMod on the video path is simply a
             # one-frame clip, which is a valid video latent.
             latent = video.latent
+            _present_refmod(presentation, video)
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
                               {"kind": "video", "latent_t": latent.shape[2],
@@ -554,6 +570,7 @@ def install_patches() -> Optional[str]:
             return
         if isinstance(video, _RefModVideoSentinel):
             latent = video.latent
+            _present_refmod(presentation, video)
             visual_latents.append(latent)
             _place_refmod_ref(self, video, refs,
                               {"kind": "video", "latent_t": latent.shape[2],
@@ -579,6 +596,7 @@ def install_patches() -> Optional[str]:
         def patched_add_audio_reference(self, waveform, presentation, audio_latents, refs):
             if isinstance(waveform, _RefModAudioSentinel):
                 latent = waveform.latent
+                _present_refmod(presentation, waveform)
                 audio_latents.append(latent)
                 _place_refmod_ref(self, waveform, refs,
                                   {"kind": "audio", "ref_audio_t": latent.shape[-1]})
@@ -646,6 +664,7 @@ def install_patches() -> Optional[str]:
                         latent = latent[..., :keep_t]
                     rewrapped = _RefModAudioSentinel(latent)
                     rewrapped.hide_ref = getattr(source, "hide_ref", False)  # keep the cap-check decision
+                    rewrapped.enc = getattr(source, "enc", None)             # keep the <Audio N> prompt entry
                     waveforms.append(rewrapped)
                     continue
                 if torch.is_tensor(source):
@@ -694,7 +713,16 @@ def install_patches() -> Optional[str]:
             # latent goes into the packed sequence at its own saved
             # resolution, exactly as it did before this step existed.
             if isinstance(video, _RefModVideoSentinel):
-                return video
+                active = _ACTIVE.get("pipeline")
+                if active is None or not _should_fit(active, width, height):
+                    return video
+                fitted = _fit_latent_to_canvas(video.latent, width, height, 100.0, "video RefMod")
+                if fitted is video.latent:
+                    return video
+                shrunk = _RefModVideoSentinel(fitted)
+                shrunk.hide_ref = video.hide_ref
+                shrunk.enc = video.enc
+                return shrunk
             return _orig_resize_video(video, height, width)
         h3_pipeline._resize_video = patched_resize_video
     else:
@@ -733,7 +761,16 @@ def install_patches() -> Optional[str]:
 
         # Fresh bookkeeping for this call -- every generate() (and every
         # sliding window, each of which is its own call) starts at phase 1.
-        _reset_gen_state(self)
+        state = _reset_gen_state(self)
+        _ACTIVE["pipeline"] = self
+        # The full output canvas for this call. Phase 1 of a two-phase run is
+        # handed a *smaller* canvas (H3_TWO_PHASE_SCALE); comparing against
+        # this is how _should_fit tells the phases apart, so single-phase and
+        # phase-2 runs are left exactly as they were.
+        try:
+            state["full_canvas"] = (int(kwargs.get("width")), int(kwargs.get("height")))
+        except (TypeError, ValueError):
+            state["full_canvas"] = None
 
         # state_json was already read (and cleared if it turned out to carry an
         # extraction job) at the top of this function -- don't re-read it here.
@@ -967,7 +1004,11 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             t = latent.shape[2]
             for _ in range(copies):
                 for j in range(t):
-                    image_sentinels.append(_RefModImageSentinel(latent[:, :, j:j + 1]))
+                    sentinel = _RefModImageSentinel(latent[:, :, j:j + 1])
+                    # One prompt entry per image, so a two-image mod really
+                    # does become <Picture N> and <Picture N+1>.
+                    sentinel.enc = _enc_item(mod, "image", j, eff)
+                    image_sentinels.append(sentinel)
         elif mod.kind == "video":
             # Video-kind mods go through Wan2GP's own native reference-video
             # slots directly -- the exact same mechanism "Use Two Reference
@@ -978,7 +1019,9 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             # since MiniMax H3 only exposes 2 such slots in total.
             if copies > 1:
                 latent = latent.repeat(1, 1, copies, 1, 1)
-            video_sentinels.append(_RefModVideoSentinel(latent))
+            sentinel = _RefModVideoSentinel(latent)
+            sentinel.enc = _enc_item(mod, "video", 0, eff)
+            video_sentinels.append(sentinel)
         else:  # "audio"
             # Same pattern as video-kind mods, one slot per mod (2 native
             # audio-reference slots total); "copies" repeats this mod's own
@@ -986,7 +1029,11 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             # second one.
             if copies > 1:
                 latent = latent.repeat(1, 1, 1, copies)
-            audio_sentinels.append(_RefModAudioSentinel(latent))
+            sentinel = _RefModAudioSentinel(latent)
+            # Audio prompt entries carry no pixels at all -- the label is the
+            # whole thing -- so an audio mod always gets one.
+            sentinel.enc = {"type": "audio"} if PROMPT_LABELS_FOR_REFMODS else None
+            audio_sentinels.append(sentinel)
 
     if not image_sentinels and not video_sentinels and not audio_sentinels:
         return kwargs
@@ -1117,6 +1164,127 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 # Extraction
 # ═══════════════════════════════════════════════════════════════════════════
+
+PROMPT_LABELS_FOR_REFMODS = True   # give each RefMod its own <Picture N> /
+                                   # <Video N> / <Audio N> entry in the prompt
+
+
+_VAE_SPATIAL_FACTOR = 16   # pixels per latent cell, both axes
+
+
+def _should_fit(pipeline_self, target_width, target_height) -> bool:
+    """True only while rendering a reduced canvas -- i.e. phase 1 of a
+    two-phase run. Single-phase runs and phase 2 are handed the full canvas
+    and are deliberately left untouched."""
+    full = _gen_state(pipeline_self).get("full_canvas")
+    if not full or None in full:
+        return False
+    try:
+        return int(target_width) < int(full[0]) or int(target_height) < int(full[1])
+    except (TypeError, ValueError):
+        return False
+
+
+def _fit_latent_to_canvas(latent, target_width, target_height, relative_size=100.0, label=""):
+    """Shrink a RefMod latent so it fits the canvas this phase is rendering at.
+
+    Two-phase generation renders phase 1 at half resolution
+    (``H3_TWO_PHASE_SCALE``), and every *live* reference is fitted to that
+    smaller canvas before being encoded -- `_prepare_image_reference` resizes
+    to a pixel budget of ``target_w * target_h * relative_size / 100``, and
+    reference videos go through `_resize_video`. A RefMod arrives already
+    encoded, so nothing used to fit it: phase 1 got a reference several times
+    larger than the frame it was conditioning, costing tokens and sitting at
+    a different scale from everything else.
+
+    The latent is resampled on its spatial axes only (time, and the 24
+    channels, are untouched), keeping aspect ratio, and **only ever made
+    smaller** -- a mod extracted below the canvas is left exactly as it is
+    rather than being blown up into detail it never had. Phase 2 and
+    single-phase runs pass the full canvas, so a normally-sized mod is
+    untouched there.
+    """
+    if latent is None or latent.dim() != 5:
+        return latent
+    h, w = latent.shape[-2], latent.shape[-1]
+    try:
+        budget = float(target_width) * float(target_height) * float(relative_size) / 100.0
+    except (TypeError, ValueError):
+        return latent
+    if budget <= 0:
+        return latent
+    current = (h * _VAE_SPATIAL_FACTOR) * (w * _VAE_SPATIAL_FACTOR)
+    if current <= budget:
+        return latent
+    scale = (budget / current) ** 0.5
+    # keep both axes even: the DiT patchifies the latent in 2x2 cells
+    new_h = max(2, int(round(h * scale / 2)) * 2)
+    new_w = max(2, int(round(w * scale / 2)) * 2)
+    if new_h >= h and new_w >= w:
+        return latent
+    new_h, new_w = min(new_h, h), min(new_w, w)
+    t = latent.shape[2]
+    flat = latent.reshape(latent.shape[0] * latent.shape[1], t, h, w)
+    resized = torch.nn.functional.interpolate(flat, size=(new_h, new_w), mode="area")
+    out = resized.reshape(latent.shape[0], latent.shape[1], t, new_h, new_w).to(latent.dtype)
+    _log(f"fitted {label or 'RefMod'} to this phase's canvas: {w}x{h} -> {new_w}x{new_h} latent cells "
+         f"({w * _VAE_SPATIAL_FACTOR}x{h * _VAE_SPATIAL_FACTOR}px -> "
+         f"{new_w * _VAE_SPATIAL_FACTOR}x{new_h * _VAE_SPATIAL_FACTOR}px)")
+    return out
+
+
+def _enc_item(mod, kind, frame_index, strength):
+    """The presentation entry for one RefMod reference, or None when the mod
+    carries no encoder frames (extracted before they were stored -- it still
+    conditions the DiT, it just gets no prompt label).
+
+    Frames are dimmed toward mid-grey in step with ``strength`` so the text
+    encoder is never shown a stronger reference than the DiT receives."""
+    if not PROMPT_LABELS_FOR_REFMODS:
+        return None
+    frames = getattr(mod, "enc_frames", None)
+    if frames is None or not frames.shape[0]:
+        return None
+    try:
+        if kind == "image":
+            index = min(frame_index, frames.shape[0] - 1)
+            chosen, stamps = frames[index:index + 1], None
+        else:
+            chosen = frames
+            times = list(getattr(mod, "enc_times", []) or [])
+            stamps = times[:chosen.shape[0]] if len(times) >= chosen.shape[0] else None
+        if strength < 1.0:
+            chosen = chosen * strength + 0.5 * (1.0 - strength)
+        item = {"type": kind, "frames": chosen.clone()}
+        if kind == "video" and stamps:
+            item["timestamps"] = stamps
+        return item
+    except Exception:
+        _log("could not build a RefMod's prompt entry:\n" + traceback.format_exc())
+        return None
+
+
+def _present_refmod(presentation, sentinel) -> None:
+    """Append this mod's prompt entry, so the text encoder sees it and the
+    prompt can address it as "<Picture N>" / "<Video N>" / "<Audio N>" --
+    exactly what a live reference gets. Without it the mod's latent still
+    conditions the DiT, but nothing in the text stream points at it, so H3's
+    own prompt structure ("<Subject 1> is the violinist from <Picture 1>")
+    has nothing to bind to."""
+    if not PROMPT_LABELS_FOR_REFMODS or presentation is None or sentinel.enc is None:
+        return
+    try:
+        presentation.append(sentinel.enc)
+    except Exception:
+        _log("could not add a RefMod's prompt entry:\n" + traceback.format_exc())
+
+
+def _qwen_frames_from_cthw(video: torch.Tensor) -> torch.Tensor:
+    """[C, T, H, W] in [-1, 1] -> [T, H, W, 3] in [0, 1]; the same conversion
+    pipeline.py's own _qwen_frames() applies before handing a live reference
+    to the Qwen3-VL text/vision encoder."""
+    return video.permute(1, 2, 3, 0).add(1.0).mul(0.5).clamp(0.0, 1.0).float().cpu()
+
 
 def _encode_ref_image(pipeline_self, video_cthw: torch.Tensor) -> torch.Tensor:
     """[C, 1, H, W] pixel tensor -> [1, 24, 1, H, W] VAE latent (cpu)."""
@@ -1324,6 +1492,7 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     frames = []
     n_img = n_vid = 0
     source_shapes = []
+    enc_frames, enc_times, enc_layout = [], [], core.ENC_LAYOUT_STILLS
     for i, (src, is_video) in enumerate(sources):
         label = f"ref {i + 1}/{len(sources)} ({'video' if is_video else 'image'})"
         status(f"H3 RefMod: encoding {label}")
@@ -1339,6 +1508,28 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         if z.dim() != 5 or z.shape[1] != 24:
             raise ValueError(f"Expected a MiniMax H3 video-VAE latent [1,24,T,H,W], got {tuple(z.shape)}.")
         source_shapes.append(f"{z.shape[2]}x{z.shape[3]}x{z.shape[4]}")
+
+        # Keep a few pixels for the text encoder, so this mod can earn a
+        # "<Picture N>" / "<Video N>" label in the prompt later (see
+        # core.encode_enc_frames). Taken from the same resized source the VAE
+        # just saw, and converted to Qwen's [T, H, W, 3] 0..1 convention --
+        # the exact thing pipeline.py's own _qwen_frames() produces for a
+        # live reference.
+        if is_video and src.shape[1] > 1:
+            enc_layout = core.ENC_LAYOUT_CLIP
+            # two frames a second, the rate Wan2GP samples a live reference
+            # video at for the encoder
+            picks, cursor = [], 0.0
+            while round(cursor) < src.shape[1]:
+                if not picks or round(cursor) > picks[-1]:
+                    picks.append(round(cursor))
+                cursor += FPS_ASSUMED_FOR_DURATION_ESTIMATE / 2
+            picks = picks[:core.ENC_MAX_CLIP_FRAMES]
+            enc_frames.append(_qwen_frames_from_cthw(src[:, picks]))
+            enc_times.extend(p / FPS_ASSUMED_FOR_DURATION_ESTIMATE for p in picks)
+        else:
+            enc_frames.append(_qwen_frames_from_cthw(src[:, :1]))
+            enc_times.append(float(len(enc_times)))
 
         if mode == "encode":
             pooled = z.to(torch.float16)
@@ -1380,6 +1571,9 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
     mod = core.H3RefMod(
         name=storage._split_folder(name)[1], kind=kind, latent=latent, latent_h=latent.shape[3], latent_w=latent.shape[4],
         latent_t=total_t, mode=mode,
+        enc_frames=(torch.cat(enc_frames) if enc_frames else None),
+        enc_times=enc_times, enc_layout=enc_layout,
+        enc_fps=(FPS_ASSUMED_FOR_DURATION_ESTIMATE if enc_layout == core.ENC_LAYOUT_CLIP else 0.0),
         source="stack" if len(frames) > 1 else ("video" if n_vid else "image"),
         source_shape=" +".join(source_shapes),
         pool=(f"full-res {px_w}x{px_h}px (short-edge cap {ref_resolution}px)" if mode == "encode"

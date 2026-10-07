@@ -620,6 +620,44 @@ load time:
    first frame is used as a still reference instead (logged once), and a
    still on the video path is treated as the one-frame clip it already is.
 
+19. **RefMods now reach the prompt.** A reference that arrives natively
+   travels two paths: its VAE latent conditions the DiT, *and* its pixels go
+   through Qwen3-VL to be embedded in the text stream at a `<Picture N>: ` /
+   `<Video N>: ` label (`<Audio N>: ` is text-only). A mod file holds only a
+   latent, so mods used to get no label -- and H3's own prompt structure
+   (`subject_definitions: <Subject 1> is the violinist from <Picture 1>`)
+   had nothing to bind to, which is why a mod's effect could be weaker than
+   the same reference supplied live. Extraction now stores a few frames
+   beside the latent as JPEGs (`enc_0..enc_N`, plus `enc_times` /
+   `enc_layout` / `enc_fps` metadata -- the same layout
+   ComfyUI-Fantastic-MiniMaxH3-PromptBuilder and the Refmod fork use, so
+   mods stay interchangeable), and each reference contributes its own
+   presentation entry at generation time. **Numbering follows the picker
+   rows, one label per image**: a two-image mod in Image Mod 1 becomes
+   `<Picture 1>` and `<Picture 2>`, a one-image mod in Image Mod 2 becomes
+   `<Picture 3>`. Live references from the main form are added first and
+   take the lower numbers. Frames are dimmed toward mid-grey in step with
+   a mod's Strength, so the encoder is never shown a stronger reference
+   than the DiT gets. Mods extracted before this still work -- they simply
+   get no label until re-extracted. Costs: the vision encoder adds tokens
+   per labelled image/video mod, and mod files grow by roughly 10-30 KB per
+   stored frame (audio mods pay neither -- their label carries no pixels).
+
+20. **Mods are fitted to the canvas each phase renders at.** Two-phase
+   generation renders phase 1 at half resolution (`H3_TWO_PHASE_SCALE`), and
+   every live reference is fitted to that smaller canvas before being
+   encoded -- `_prepare_image_reference` resizes to a pixel budget of
+   `target_w * target_h * relative_size / 100`, reference videos go through
+   `_resize_video`. A RefMod arrives already encoded, so nothing used to fit
+   it, and phase 1 received a reference several times larger than the frame
+   it was conditioning. The latent is now resampled on its spatial axes only
+   (time and the 24 channels untouched), aspect ratio kept, both axes kept
+   even for the DiT's 2x2 patching, and **only ever made smaller** -- a mod
+   extracted below the canvas is left exactly as it is rather than blown up
+   into detail it never had. The fit is gated on the canvas actually being
+   reduced (compared against the full `width`/`height` this generate() call
+   was given), so **single-phase runs and phase 2 are untouched**.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.

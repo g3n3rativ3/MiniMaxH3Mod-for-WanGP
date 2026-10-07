@@ -31,6 +31,7 @@ that changes is the token budget.
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -38,6 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -434,6 +436,68 @@ def fit_audio_token_budget(latent: torch.Tensor, budget: int, label: str) -> Tup
     return latent, messages
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Encoder frames -- the pictures MiniMax H3's text encoder is shown for a mod
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A reference that reaches the model natively travels two paths: its VAE
+# latent conditions the DiT, and its *pixels* go through Qwen3-VL and are
+# embedded into the text stream at a "<Picture N>: " / "<Video N>: " label.
+# A mod file only holds the latent, so without pixels a mod gets no label and
+# the prompt has no way to refer to it -- which is why H3's own prompt
+# structure ("subject_definitions: <Subject 1> is the violinist from
+# <Picture 1>") could never bind to a mod.
+#
+# So a few frames are stored alongside the latent, as JPEGs, in the same
+# layout ComfyUI-Fantastic-MiniMaxH3-PromptBuilder and the Refmod fork use,
+# so mods stay interchangeable with those tools:
+#   * tensors "enc_0".."enc_{N-1}": one JPEG each, as uint8
+#   * metadata "enc_times":  one timestamp per frame
+#   * metadata "enc_fps":    the rate a clip's frames were sampled at
+#   * metadata "enc_layout": "stills" (one per picture) or "clip"
+ENC_LAYOUT_STILLS, ENC_LAYOUT_CLIP = "stills", "clip"
+ENC_MAX_EDGE = 512        # encoder frames are downscaled to this long edge:
+                          # Qwen3-VL's token cost grows with resolution, and a
+                          # label only needs the subject to be recognisable
+ENC_JPEG_QUALITY = 95
+ENC_MAX_CLIP_FRAMES = 8   # how many frames of a clip the encoder is shown
+
+
+def encode_enc_frames(frames: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """[N, H, W, 3] float 0..1 -> {"enc_0": uint8 JPEG bytes, ...}."""
+    from PIL import Image
+    out = {}
+    for i in range(frames.shape[0]):
+        arr = (frames[i].clamp(0, 1) * 255).round().byte().cpu().numpy()
+        img = Image.fromarray(arr, mode="RGB")
+        if max(img.size) > ENC_MAX_EDGE:
+            scale = ENC_MAX_EDGE / max(img.size)
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=ENC_JPEG_QUALITY)
+        out[f"enc_{i}"] = torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8).clone()
+    return out
+
+
+def decode_enc_frames(tensors) -> Optional[torch.Tensor]:
+    """{"enc_0": ...} -> [N, H, W, 3] float 0..1, or None if there are none."""
+    from PIL import Image
+    keys = sorted((k for k in tensors if k.startswith("enc_")),
+                  key=lambda k: int(k.split("_", 1)[1]))
+    if not keys:
+        return None
+    frames = []
+    for k in keys:
+        img = Image.open(io.BytesIO(bytes(tensors[k].cpu().numpy()))).convert("RGB")
+        frames.append(torch.from_numpy(np.asarray(img).copy()).float().div_(255.0))
+    if len({tuple(f.shape) for f in frames}) > 1:
+        h = max(f.shape[0] for f in frames); w = max(f.shape[1] for f in frames)
+        frames = [F.interpolate(f.permute(2, 0, 1).unsqueeze(0), size=(h, w),
+                                mode="bilinear", align_corners=False).squeeze(0).permute(1, 2, 0)
+                  for f in frames]
+    return torch.stack(frames)
+
+
 @dataclass
 class H3RefMod:
     """A compressed reference for MiniMax H3.
@@ -468,6 +532,13 @@ class H3RefMod:
     tags: List[str] = field(default_factory=list)
     description: str = ""
     concept_type: str = "generic"
+    # Pixels shown to the text encoder so the mod earns a <Picture N> /
+    # <Video N> label. [N, H, W, 3] float 0..1, or None for mods extracted
+    # before this existed (they still work, just without a prompt label).
+    enc_frames: Optional[torch.Tensor] = None
+    enc_times: List[float] = field(default_factory=list)
+    enc_layout: str = ENC_LAYOUT_STILLS
+    enc_fps: float = 0.0
 
     def __post_init__(self):
         if self.kind not in ("image", "video", "audio"):
@@ -534,7 +605,13 @@ class H3RefMod:
             "description": self.description, "concept_type": self.concept_type,
             "_format_version": 2, "_produced_by": "wan2gp-minimax-h3-refmod",
         }
-        save_file({"latent": self.latent.contiguous()}, path_no_ext + ".safetensors",
+        tensors = {"latent": self.latent.contiguous()}
+        if self.enc_frames is not None and self.enc_frames.shape[0]:
+            tensors.update(encode_enc_frames(self.enc_frames))
+            meta["enc_times"] = [float(t) for t in self.enc_times] or list(range(self.enc_frames.shape[0]))
+            meta["enc_layout"] = self.enc_layout
+            meta["enc_fps"] = float(self.enc_fps)
+        save_file(tensors, path_no_ext + ".safetensors",
                   metadata={META_KEY: json.dumps(meta)})
         return path_no_ext + ".safetensors"
 
@@ -543,7 +620,13 @@ class H3RefMod:
         meta = read_refmod_meta(path_no_ext)
         if meta is None:
             raise ValueError(f"{path_no_ext}.safetensors has no RefMod metadata.")
-        latent = load_file(path_no_ext + ".safetensors", device=device)["latent"].clone()
+        tensors = load_file(path_no_ext + ".safetensors", device=device)
+        latent = tensors["latent"].clone()
+        try:
+            enc_frames = decode_enc_frames(tensors)
+        except Exception as e:
+            print(f"[H3RefMod] could not read encoder frames from {path_no_ext}: {e!r}")
+            enc_frames = None
         # NOTE: dict.get(key, fallback) always evaluates `fallback` eagerly, even
         # when `key` is present and the fallback goes unused -- so the fallback
         # expression itself must never index a dimension that might not exist.
@@ -569,4 +652,8 @@ class H3RefMod:
             tags=list(meta.get("tags", [])),
             description=str(meta.get("description", "") or ""),
             concept_type=str(meta.get("concept_type", "generic") or "generic"),
+            enc_frames=enc_frames,
+            enc_times=[float(t) for t in (meta.get("enc_times") or [])],
+            enc_layout=str(meta.get("enc_layout") or ENC_LAYOUT_STILLS),
+            enc_fps=float(meta.get("enc_fps") or 0.0),
         )
