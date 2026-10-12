@@ -547,20 +547,33 @@ load time:
    re-wraps the result back into a sentinel so `_add_audio_reference`
    downstream still recognizes it. Every non-sentinel source is delegated
    to the untouched original per-source logic, unchanged.
-13. `_inject_refmods` itself checks `kwargs.get("window_no")` before doing
-   anything else, and skips RefMod injection entirely when it's an int
-   greater than 1. Wan2GP's own sliding-window loop (also used by
-   **Continue Video**) calls `generate()` once per window, passing
-   `custom_settings` (carrying the RefMod selection) unconditionally every
-   time -- but its own *native* references (`image_refs`, `prefix_video`,
-   a reference video's own frames) are only fed into `window_no==1`; every
-   later window continues from the previous window's own tail frames
-   instead, never the original reference again. Without this check, a
-   RefMod -- having no visibility into which window it's on from inside
-   `generate()` itself -- would get re-injected as a "reference" on every
-   single window, so a few frames of it would visibly appear at every
-   window boundary in the output. A plain, single-window generation never
-   sets `window_no` above 1 either, so this never affects normal use.
+13. **Sliding windows.** WanGP calls `generate()` once per window and passes
+   `custom_settings` (carrying the RefMod selection) every time, so a mod is
+   in principle available to every window. What its own live references do,
+   checked in `wgp.py`: `src_ref_images` and `audio_guide` are both assigned
+   *before* the window loop and handed to every `generate()` call, and a
+   reference video (`-`) is re-extracted from frame 0 on every window
+   (`guide_frames_extract_start = 0 if reference_videos`). The `window_no ==
+   1` gates nearby only skip *re-preprocessing* them; they do not stop them
+   being passed. So **image and audio mods are injected on every window**,
+   matching that exactly -- which is what keeps an identity stable instead of
+   drifting into a different face a window or two in.
+
+   Video mods are the one case with a real trade-off, and the inline panel
+   exposes it as **"Video mods on sliding windows 2, 3, ..."**:
+
+   - **First frame as a still** (default) -- the mod's first latent frame
+     goes in as an image reference, labelled `<Picture N>`. Keeps the
+     identity; cannot reproduce the clip's motion, so none of its frames can
+     surface at the window boundary.
+   - **Whole clip, like a live reference video** -- full parity with a live
+     reference video. Strongest conditioning, but a few of the mod's own
+     frames can show up at the boundary.
+   - **Not at all** -- the mod applies to the first window only (what
+     v0.30-v0.35 did for every mod kind).
+
+   A plain single-window generation never sets `window_no` above 1, so none
+   of this affects it.
 
 14. `_prepare_condition_rows` is wrapped to lift Wan2GP's own reference
    caps for RefMods. `generate()` enforces "at most 12 references: 9

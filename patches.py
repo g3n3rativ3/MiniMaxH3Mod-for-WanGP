@@ -952,22 +952,7 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 
 def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
-    if isinstance(window_no, int) and window_no > 1:
-        # Wan2GP's own sliding-window loop (also used by "Continue Video")
-        # only feeds its *native* references (image_refs, prefix_video, a
-        # reference video's own frames, etc.) into window_no==1 -- every
-        # later window continues from the *previous* window's own tail
-        # frames instead, not the original reference again (see wgp.py's
-        # own "if window_no == 1 and image_refs is not None..." gates).
-        # custom_settings (carrying our RefMod selection) is passed to
-        # every window's generate() call unconditionally, though -- and
-        # since RefMod injection happens down here, inside generate()
-        # itself, it has no visibility into which window this is unless we
-        # check window_no explicitly. Without this check, a video-kind (or
-        # image-kind) RefMod would get re-injected as a "reference" on
-        # every single window, so a few frames of it visibly appear at
-        # every window boundary in the output -- this is exactly that bug.
-        return kwargs
+    later_window = isinstance(window_no, int) and window_no > 1
     try:
         state = json.loads(state_json)
     except Exception as e:
@@ -983,6 +968,9 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     if isinstance(curve, list):
         curve = tuple(curve)
     seed = int(state.get("scramble_seed", -1))
+    window_mode = str(state.get("window_mode") or WINDOW_MODE_DEFAULT)
+    if window_mode not in (WINDOW_MODE_STILL, WINDOW_MODE_FULL, WINDOW_MODE_FIRST):
+        window_mode = WINDOW_MODE_DEFAULT
 
     loaded_rows = []  # (mod, strength, copies), one entry per selected row, in order
     for row in rows:
@@ -1040,6 +1028,17 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             # mod's own frames within its one slot (extending its own
             # duration) instead of spawning extra slot-consuming instances,
             # since MiniMax H3 only exposes 2 such slots in total.
+            if later_window and window_mode == WINDOW_MODE_FIRST:
+                continue  # this mod sits out every window after the first
+            if later_window and window_mode == WINDOW_MODE_STILL:
+                # Keep the identity, drop the motion: one still reference,
+                # the mod's own first latent frame. A whole clip handed to a
+                # later window can surface a few of its frames at the window
+                # boundary; a single still cannot.
+                still = _RefModImageSentinel(latent[:, :, :1])
+                still.enc = _enc_as_still(_enc_item(mod, "video", 0, eff))
+                image_sentinels.append(still)
+                continue
             if copies > 1:
                 latent = latent.repeat(1, 1, copies, 1, 1)
             sentinel = _RefModVideoSentinel(latent)
@@ -1198,9 +1197,10 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
                 else:
                     visible_visual += 1
 
+    where = f" [sliding window {window_no}, video mods: {window_mode}]" if later_window else ""
     _log(f"injecting {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
-         f"retention={retention:.2f} (~{total_tokens} tokens)")
+         f"retention={retention:.2f} (~{total_tokens} tokens){where}")
     return kwargs
 
 
@@ -1210,6 +1210,19 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
 
 PROMPT_LABELS_FOR_REFMODS = True   # give each RefMod its own <Picture N> /
                                    # <Video N> / <Audio N> entry in the prompt
+
+# What a video-kind mod does on sliding windows after the first one. Image and
+# audio mods always reach every window, which is what WanGP itself does with
+# live references: src_ref_images and audio_guide are both assigned once,
+# before the window loop in wgp.py, and handed to every generate() call, and a
+# reference video ("-") is re-extracted from frame 0 on every window
+# (guide_frames_extract_start = 0 if reference_videos). Video mods are the one
+# case worth a choice, because a whole clip given to a later window can let a
+# few of its own frames surface at the window boundary.
+WINDOW_MODE_STILL = "still"   # first latent frame only, as an image reference
+WINDOW_MODE_FULL = "full"     # the whole clip, exactly like a live reference video
+WINDOW_MODE_FIRST = "first"   # nothing at all after window 1
+WINDOW_MODE_DEFAULT = WINDOW_MODE_STILL
 
 
 _VAE_SPATIAL_FACTOR = 16   # pixels per latent cell, both axes

@@ -57,6 +57,19 @@ VIDEO_ROWS = 6
 AUDIO_ROWS = 4
 NONE_CHOICE = "(none)"
 
+# How video-kind mods behave on sliding windows after the first one. Image and
+# audio mods always go to every window (that is what WanGP does with its own
+# live references: src_ref_images / audio_guide are set once, before the window
+# loop, and passed to every generate() call), so only the video case is a
+# choice. The values are what travels in the serialized state; see
+# patches.WINDOW_MODE_* for what each one does at injection time.
+WINDOW_MODE_CHOICES = [
+    ("First frame as a still (recommended)", "still"),
+    ("Whole clip, like a live reference video", "full"),
+    ("Not at all (first window only)", "first"),
+]
+WINDOW_MODE_DEFAULT = "still"
+
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
 # so this UI doesn't need a live import of Wan2GP internals just to draw a
 # dropdown. If a future Wan2GP version changes these, only this dropdown's
@@ -382,7 +395,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.35.0"
+        self.version = "0.36.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -503,7 +516,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 mdd, strength = vals[i * 2], vals[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:
                     rows.append({"mod": mdd, "strength": float(strength)})
-            payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}
+            window_mode = vals[n_rows * 2] if len(vals) > n_rows * 2 else WINDOW_MODE_DEFAULT
+            payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
+                       "window_mode": window_mode or WINDOW_MODE_DEFAULT}
             if not isinstance(state, dict):
                 return state, "⚠️ Could not access session state -- try reloading the page."
             if rows:
@@ -610,7 +625,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         for w in row_widgets:
             w.change(fn=update_counter, inputs=row_widgets, outputs=[counter], queue=False)
 
-        return mod_rows
+        window_mode = gr.Dropdown(
+            label="Video mods on sliding windows 2, 3, ...",
+            choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
+            info="Only matters when Number of frames needs more than one window. Image and "
+                 "audio mods always reach every window, exactly like a live reference does. "
+                 "Video mods have a known quirk: given whole to a later window, a few of their "
+                 "own frames can surface at the window boundary. 'First frame as a still' keeps "
+                 "the identity without the motion that causes that.")
+
+        # Appended as a one-element pseudo-row so both callers (inline panel
+        # and the plugin's own Generate tab) pick it up through the same flat
+        # widget list; each reads it back at index IMAGE_ROWS+VIDEO_ROWS+AUDIO_ROWS)*2.
+        return mod_rows + [(window_mode,)]
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"
@@ -1043,7 +1070,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 mdd, strength = row_values[i * 2], row_values[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:
                     rows.append({"mod": mdd, "strength": float(strength)})
-            state_payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None}
+            window_mode = row_values[n_rows * 2] if len(row_values) > n_rows * 2 else WINDOW_MODE_DEFAULT
+            state_payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
+                             "window_mode": window_mode or WINDOW_MODE_DEFAULT}
 
             overrides = dict(synced_settings or {})
             overrides.update({
