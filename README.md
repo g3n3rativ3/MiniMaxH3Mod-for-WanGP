@@ -658,6 +658,18 @@ load time:
    reduced (compared against the full `width`/`height` this generate() call
    was given), so **single-phase runs and phase 2 are untouched**.
 
+21. **Image / single-frame output handles video mods itself.** Recent WanGP
+   builds fold reference videos into the image references natively when the
+   output is a single frame: `input_ref_images = [..., guide_to_float(
+   input_frames)]`, then `video_references = False`. Two consequences for
+   RefMods: `guide_to_float()` reads `.dtype` (every sentinel now reports its
+   latent's, so the helper returns it untouched instead of raising
+   `AttributeError`), and only the *first* reference video survives that
+   fold. So on image output the plugin converts **every** video-kind mod to a
+   still reference itself -- first latent frame each -- before the native
+   slots are ever filled, and relabels its prompt entry `<Picture N>` rather
+   than `<Video N>`, matching the single still the DiT actually receives.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.

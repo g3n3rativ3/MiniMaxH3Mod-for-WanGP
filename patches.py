@@ -121,6 +121,15 @@ class _RefModImageSentinel:
         self.hide_ref = False
         self.enc = None   # presentation payload: dict or None
 
+    @property
+    def dtype(self):
+        # Wan2GP's shared guide_to_float()/guide_to_dtype() helpers probe
+        # `.dtype` to decide whether a reference is a uint8 control guide
+        # that needs converting; reporting the latent's own (floating) dtype
+        # makes them treat a sentinel as an already-float tensor and hand it
+        # straight back untouched, instead of raising AttributeError.
+        return self.latent.dtype
+
 
 class _RefModVideoSentinel:
     """Stands in for a multi-frame ("video kind") reference. Carries an
@@ -143,6 +152,14 @@ class _RefModVideoSentinel:
         self.latent = latent
         self.hide_ref = False
         self.enc = None   # presentation payload: dict or None
+
+    @property
+    def dtype(self):
+        # See _RefModImageSentinel.dtype. This one matters in practice: on
+        # image/single-frame output WanGP itself now folds the first
+        # reference video into the image references with
+        # guide_to_float(input_frames), which reads `.dtype` first.
+        return self.latent.dtype
 
     @property
     def shape(self):
@@ -199,6 +216,11 @@ class _RefModAudioSentinel:
         self.latent = latent
         self.hide_ref = False
         self.enc = None   # presentation payload: dict or None
+
+    @property
+    def dtype(self):
+        # See _RefModImageSentinel.dtype.
+        return self.latent.dtype
 
 
 def _log(msg: str) -> None:
@@ -543,6 +565,7 @@ def install_patches() -> Optional[str]:
             latent = (_fit_latent_to_canvas(image.latent[:, :, :1], target_width, target_height,
                                             image_refs_relative_size, "video RefMod (as still)")
                       if _should_fit(self, target_width, target_height) else image.latent[:, :, :1])
+            image.enc = _enc_as_still(image.enc)  # one still latent -> "<Picture N>", not "<Video N>"
             _present_refmod(presentation, image)
             visual_latents.append(latent)
             _place_refmod_ref(self, image, refs,
@@ -1038,6 +1061,26 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     if not image_sentinels and not video_sentinels and not audio_sentinels:
         return kwargs
 
+    # Image / single-frame output: a reference *video* has no place to go.
+    # WanGP handles its own live case by folding only the first reference
+    # video into the image references and switching reference videos off
+    # entirely ("if image_outputs and video_references: input_ref_images =
+    # [..., guide_to_float(input_frames)]; video_references = False" in
+    # pipeline.generate). If we put video RefMods in the native video slots
+    # here, that same code would keep the first one and silently drop any
+    # others. Convert them ourselves instead -- one still reference per mod,
+    # from its first latent frame, exactly what the image path can use.
+    if int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False):
+        if video_sentinels:
+            for sentinel in video_sentinels:
+                still = _RefModImageSentinel(sentinel.latent[:, :, :1])
+                still.enc = _enc_as_still(sentinel.enc)
+                image_sentinels.append(still)
+            _log(f"image output mode: {len(video_sentinels)} video-kind RefMod(s) converted to "
+                 f"still image references (first frame each) -- a reference video has no meaning "
+                 f"for a single-frame output, and WanGP would otherwise keep only the first one.")
+            video_sentinels = []
+
     state = _gen_state(pipeline_self)
 
     # Live (non-RefMod) references already in this generation -- they still
@@ -1262,6 +1305,21 @@ def _enc_item(mod, kind, frame_index, strength):
     except Exception:
         _log("could not build a RefMod's prompt entry:\n" + traceback.format_exc())
         return None
+
+
+def _enc_as_still(enc):
+    """Re-label a video mod's prompt entry as a still picture, keeping only
+    its first frame. Used when a video-kind RefMod ends up on the image
+    reference path (image / single-frame output): the DiT then receives one
+    still latent, so the text encoder must be shown one still too -- labelled
+    "<Picture N>", not "<Video N>", or the prompt would address something
+    that is not there."""
+    if not isinstance(enc, dict) or enc.get("type") != "video":
+        return enc
+    frames = enc.get("frames")
+    if frames is None or not getattr(frames, "shape", (0,))[0]:
+        return None
+    return {"type": "image", "frames": frames[:1].clone()}
 
 
 def _present_refmod(presentation, sentinel) -> None:
