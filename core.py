@@ -456,25 +456,41 @@ def fit_audio_token_budget(latent: torch.Tensor, budget: int, label: str) -> Tup
 #   * metadata "enc_fps":    the rate a clip's frames were sampled at
 #   * metadata "enc_layout": "stills" (one per picture) or "clip"
 ENC_LAYOUT_STILLS, ENC_LAYOUT_CLIP = "stills", "clip"
-ENC_MAX_EDGE = 512        # encoder frames are downscaled to this long edge:
-                          # Qwen3-VL's token cost grows with resolution, and a
-                          # label only needs the subject to be recognisable
-ENC_JPEG_QUALITY = 95
+ENC_MAX_EDGE = 1024       # long edge of the frames shown to Qwen3-VL -- the
+                          # channel that binds a mod to its <Picture N> label.
+                          # A *live* reference is shown the whole image at the
+                          # generation canvas (1280x720 -> 880 vision tokens);
+                          # at the old 512 a mod got 144, a 6x deficit on the
+                          # circuit that carries recognition. 1024 -> 576,
+                          # which is live-reference territory. Qwen3-VL's own
+                          # ceiling for a still is 16.7 Mpixels, far above any
+                          # value offered here, so this is purely a cost dial.
+ENC_MAX_EDGE_CLIP = 512   # clips keep the smaller edge: a video mod stores up
+                          # to ENC_MAX_CLIP_FRAMES of them, and Qwen's video
+                          # path is budgeted per frame-pair, not per frame
+ENC_JPEG_QUALITY = 96
 ENC_MAX_CLIP_FRAMES = 8   # how many frames of a clip the encoder is shown
 
 
-def encode_enc_frames(frames: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """[N, H, W, 3] float 0..1 -> {"enc_0": uint8 JPEG bytes, ...}."""
+def encode_enc_frames(frames: torch.Tensor, max_edge: Optional[int] = None) -> Dict[str, torch.Tensor]:
+    """[N, H, W, 3] float 0..1 -> {"enc_0": uint8 JPEG bytes, ...}.
+
+    ``max_edge`` caps the long edge (default ENC_MAX_EDGE); it never upscales."""
     from PIL import Image
+    cap = int(max_edge or ENC_MAX_EDGE)
     out = {}
     for i in range(frames.shape[0]):
         arr = (frames[i].clamp(0, 1) * 255).round().byte().cpu().numpy()
         img = Image.fromarray(arr, mode="RGB")
-        if max(img.size) > ENC_MAX_EDGE:
-            scale = ENC_MAX_EDGE / max(img.size)
-            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))))
+        if max(img.size) > cap:
+            scale = cap / max(img.size)
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                             Image.Resampling.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=ENC_JPEG_QUALITY)
+        # subsampling=0 keeps full chroma resolution: JPEG's default 4:2:0
+        # halves the color detail, which is exactly where skin tone and eye
+        # color live, and those are what the vision encoder reads an identity from.
+        img.save(buf, format="JPEG", quality=ENC_JPEG_QUALITY, subsampling=0)
         out[f"enc_{i}"] = torch.frombuffer(bytearray(buf.getvalue()), dtype=torch.uint8).clone()
     return out
 
@@ -539,6 +555,8 @@ class H3RefMod:
     enc_times: List[float] = field(default_factory=list)
     enc_layout: str = ENC_LAYOUT_STILLS
     enc_fps: float = 0.0
+    # Long edge the prompt-view frames are stored at. None = the module default.
+    enc_max_edge: Optional[int] = None
 
     def __post_init__(self):
         if self.kind not in ("image", "video", "audio"):
@@ -607,7 +625,8 @@ class H3RefMod:
         }
         tensors = {"latent": self.latent.contiguous()}
         if self.enc_frames is not None and self.enc_frames.shape[0]:
-            tensors.update(encode_enc_frames(self.enc_frames))
+            tensors.update(encode_enc_frames(self.enc_frames, self.enc_max_edge))
+            meta["enc_max_edge"] = int(self.enc_max_edge or ENC_MAX_EDGE)
             meta["enc_times"] = [float(t) for t in self.enc_times] or list(range(self.enc_frames.shape[0]))
             meta["enc_layout"] = self.enc_layout
             meta["enc_fps"] = float(self.enc_fps)

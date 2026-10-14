@@ -172,11 +172,18 @@ def list_refmods_info(folder: Optional[str] = None, recursive: bool = False) -> 
             else:
                 tokens = (latent_h // 2) * (latent_w // 2) * latent_t
             size_mb = os.path.getsize(mod_path(name) + ".safetensors") / (1024 * 1024)
+            # The "tokens" column counts the DiT channel only (the VAE latent).
+            # A mod also feeds Qwen3-VL through its stored prompt-view frames,
+            # which is a different budget entirely -- surface it so raising the
+            # prompt-view resolution is visible somewhere in the UI. Mods from
+            # before that setting existed report the old fixed 512.
+            prompt_view = int(meta.get("enc_max_edge", 512)) if meta.get("enc_layout") else 0
             out.append({
                 "name": name,
                 "kind": meta.get("kind", "?"),
                 "mode": meta.get("mode", "?"),
                 "tokens": tokens,
+                "prompt_view": prompt_view,
                 "source": meta.get("source", ""),
                 "description": meta.get("description", ""),
                 "concept_type": meta.get("concept_type", "generic"),

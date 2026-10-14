@@ -365,7 +365,9 @@ def _library_rows(folder=None):
         list_folder, recursive = None, True
     else:
         list_folder, recursive = folder, True
-    return [[i["name"], i["kind"], i["mode"], i["tokens"], i["size_mb"], i["concept_type"], i["description"]]
+    return [[i["name"], i["kind"], i["mode"], i["tokens"],
+             (f'{i["prompt_view"]}px' if i.get("prompt_view") else "--"),
+             i["size_mb"], i["concept_type"], i["description"]]
             for i in storage.list_refmods_info(folder=list_folder, recursive=recursive)]
 
 
@@ -395,7 +397,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.36.0"
+        self.version = "0.38.1"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -678,12 +680,26 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Accordion("Advanced", open=True):
             with gr.Row():
                 ref_resolution = gr.Slider(256, 2048, value=1024, step=64, label="Ref resolution (short edge, px)",
-                                           info="Size before encoding. Smaller = faster, less detail.")
+                                           info="Cap, never an upscale: a source whose short edge is "
+                                                "already below this is encoded untouched. Feeds the DiT.")
+                enc_resolution = gr.Slider(256, 2048, value=core.ENC_MAX_EDGE, step=64,
+                                           label="Prompt-view resolution (long edge, px)",
+                                           info="Feeds Qwen3-VL, the channel that binds this mod to its "
+                                                "<Picture N> label in the prompt. Default matches what a "
+                                                "live reference gets. Lower = fewer vision tokens, weaker "
+                                                "recognition. Video mods are capped lower (they store "
+                                                "several frames).")
                 pool_h = gr.Slider(2, 64, value=16, step=2, label="Pool grid height (training mode)",
                                    info="Training mode. Bigger grid = more detail, more tokens.")
                 pool_w = gr.Slider(2, 64, value=16, step=2, label="Pool grid width (training mode)",
                                    info="Training mode. Same as height, other axis.")
             pool_warning = gr.Markdown("")
+            encode_mode_note = gr.Markdown(
+                "ℹ️ **Mode is set to `encode`, so Pool grid and Identity refinement steps do "
+                "nothing** -- the latent is kept at full VAE resolution, there is no pooled grid "
+                "to size and nothing to refine *towards* (the full encode is already the target). "
+                "Changing them produces a byte-for-byte identical mod. Switch Mode to `training` "
+                "to use them.", visible=False)
             with gr.Row():
                 latent_frames = gr.Slider(0.1, latent_frames_to_seconds(MAX_LATENT_FRAMES),
                                           value=latent_frames_to_seconds(16), step=0.1,
@@ -699,7 +715,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                "add together, so one mod near 14.9s leaves no room for a "
                                                "second one of the same kind alongside it.**")
                 identity = gr.Slider(0, 2000, value=500, step=50, label="Identity refinement steps (training mode)",
-                                     info="Training mode. Higher = truer to original.")
+                                     info="Training mode. Higher = truer to original, but it converges "
+                                          "around 200 steps and is flat after that -- 500 and 2000 give "
+                                          "the same file. 0 skips it.")
                 multiplier = gr.Slider(1, 10, value=1, step=1, label="Repeat multiplier",
                                        info="Repeats the mod. Higher = stronger effect, bigger file.")
                 max_tokens = gr.Slider(0, 65536, value=65536, step=512, label="Max tokens (0 = no cap)",
@@ -724,6 +742,19 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
             w.change(fn=update_pool_warning, inputs=[concept_type, mode, pool_h, pool_w],
                     outputs=[pool_warning], queue=False)
 
+        def update_mode_controls(mode_value):
+            # These three are read only on the "training" branch of the
+            # extractor (see patches._run_extraction: encode keeps the raw VAE
+            # latent and records optimize_steps=0). Showing them as live
+            # controls in encode mode invites setting them and getting an
+            # identical file back, so hide them and say why.
+            training = mode_value == "training"
+            return (gr.update(visible=training), gr.update(visible=training),
+                    gr.update(visible=training), gr.update(visible=not training))
+
+        mode.change(fn=update_mode_controls, inputs=[mode],
+                    outputs=[pool_h, pool_w, identity, encode_mode_note], queue=False)
+
         def update_audio_duration_warning(audio_path, current_seconds):
             if not audio_path:
                 return ""
@@ -746,8 +777,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                     outputs=[audio_duration_warning], queue=False)
 
         def do_extract(model_type, name, mode, concept_type, ref_images, ref_videos, ref_audio,
-                       remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                       identity, multiplier, max_tokens, description, save):
+                       remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
+                       latent_frames, identity, multiplier, max_tokens, description, save):
             if not model_type:
                 return "Pick a MiniMax H3 Ref2VA model above first."
             image_paths = [f.name if hasattr(f, "name") else f for f in (ref_images or [])]
@@ -763,7 +794,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 "image_paths": image_paths, "video_paths": video_paths,
                 "audio_path": ref_audio,
                 "remove_background_images_ref": int(remove_background_images_ref or 0),
-                "ref_resolution": int(ref_resolution), "pool_h": int(pool_h), "pool_w": int(pool_w),
+                "ref_resolution": int(ref_resolution), "enc_resolution": int(enc_resolution),
+                "pool_h": int(pool_h), "pool_w": int(pool_w),
                 "latent_frames": seconds_to_latent_frames(latent_frames), "identity": int(identity),
                 "multiplier": int(multiplier), "max_tokens": int(max_tokens),
                 "description": description or "", "save": bool(save),
@@ -797,8 +829,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         extract_btn.click(
             fn=do_extract,
             inputs=[model_dd, name, mode, concept_type, ref_images, ref_videos, ref_audio,
-                   remove_background_images_ref, ref_resolution, pool_h, pool_w, latent_frames,
-                   identity, multiplier, max_tokens, description, save],
+                   remove_background_images_ref, ref_resolution, enc_resolution, pool_h, pool_w,
+                   latent_frames, identity, multiplier, max_tokens, description, save],
             outputs=[extract_status],
             queue=False,
         )
@@ -820,7 +852,8 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                                                  f"seeing every mod again.")
             refresh_btn = gr.Button("Refresh", scale=1)
         table = gr.Dataframe(
-            headers=["name", "kind", "mode", "tokens", "size (MB)", "concept type", "description"],
+            headers=["name", "kind", "mode", "DiT tokens", "prompt view", "size (MB)",
+                     "concept type", "description"],
             value=_library_rows(), interactive=False, wrap=True)
         with gr.Row():
             delete_name = gr.Textbox(label="Mod name to delete (include its folder, e.g. characters/tanya)",

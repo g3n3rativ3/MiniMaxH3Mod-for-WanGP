@@ -683,6 +683,89 @@ load time:
    slots are ever filled, and relabels its prompt entry `<Picture N>` rather
    than `<Video N>`, matching the single still the DiT actually receives.
 
+## The two channels a RefMod feeds, and what each one's resolution control does
+
+A mod conditions the model through **two separate circuits**, and each has its
+own resolution control in Advanced.
+
+**Ref resolution (short edge)** -> the VAE latent -> the DiT. This is a *cap,
+never an upscale* (`resize_cthw` does `min(1.0, cap / short_edge)`): a source
+whose short edge already sits below it is encoded untouched. A 2560x1440
+photo with the cap at 2048 is encoded at 2560x1440, and raising the cap to
+4096 would change nothing. Aspect ratio is preserved, so only the short edge
+is compared: an 8000x2048 panorama passes through whole, at 500x128 latent
+cells (16000 tokens, a 3 MB latent).
+
+**Prompt-view resolution (long edge)** -> JPEG frames -> Qwen3-VL. This is the
+channel that binds the mod to its `<Picture N>` label, which is how the prompt
+can say "the woman from `<Picture 1>`". A *live* reference is shown the whole
+image at the generation canvas; mods used to be capped at 512 px, which is a
+6x deficit in vision tokens on the circuit that carries recognition:
+
+| stored long edge | JPEG size | vision tokens |
+|---|---|---|
+| 512 (old default) | 83 KB | 144 |
+| **1024 (new default)** | **237 KB** | **576** |
+| 1536 | 440 KB | 1296 |
+| 2048 | 687 KB | 2304 |
+| *live reference, 1280x720 canvas* | - | *880* |
+| *live reference, 1344x768 canvas* | - | *1008* |
+
+Qwen3-VL's own ceiling for a still is 16.7 Mpixels, far above anything offered
+here, so this slider is purely a cost dial: a few hundred KB of mod file and a
+few hundred tokens through the text encoder, paid once per generation. Video
+mods keep a lower per-frame cap (`ENC_MAX_EDGE_CLIP`), since a clip stores up
+to 8 views. JPEG is written at quality 96 with `subsampling=0`, because the
+default 4:2:0 halves color detail and that is where skin tone and eye color
+live.
+
+Existing mods are unaffected and keep working; they carry whatever prompt-view
+they were extracted with. Re-extract to benefit.
+
+VAE tiling is now enabled before extraction encodes anything. Extraction runs
+before the pipeline's own `_configure_tiling()`, so on the first task after a
+model load the VAE was still untiled and a large source could exhaust VRAM in
+a single encode.
+
+## Mode, Pool grid and Identity refinement: what actually applies
+
+`Mode` decides which of the two extraction branches runs, and three Advanced
+controls only exist on one of them:
+
+| Control | `training` | `encode` |
+|---|---|---|
+| Ref resolution | used | used |
+| Pool grid H / W | used | **ignored** |
+| Identity refinement steps | used | **ignored** |
+
+In `encode` the latent is kept exactly as the VAE produced it: there is no
+pooled grid to size, and nothing to refine *towards*, because the full encode
+is already the target the refinement would aim at. The saved metadata shows
+it (`"pool": "full-res ...", "optimize_steps": 0`), and two `encode` mods that
+differ only in those settings come out byte-for-byte identical. The extract
+form now hides both controls when Mode is `encode` and says so, instead of
+leaving them there to be set to no effect.
+
+Measured on a real 1440p portrait (full-res latent 90x160, 3600 tokens),
+relative error of the mod's reconstruction against that full latent:
+
+| Setting | Grid | Tokens | Rel. error |
+|---|---|---|---|
+| training, pool 16, 0 steps | 8x16 | 32 | 0.551 |
+| training, pool 16, 500 steps | 8x16 | 32 | 0.525 |
+| training, pool 64, 0 steps | 36x64 | 576 | 0.358 |
+| training, pool 64, 500 steps | 36x64 | 576 | 0.319 |
+| encode | 90x160 | 3600 | 0.000 |
+
+So Pool grid is the parameter that matters in training mode (it sets both the
+detail kept and the token cost), refinement buys roughly another 5-11% on top
+of whatever grid was chosen, and `encode` makes both irrelevant by keeping
+everything. Note the grid is adjusted to the source's aspect ratio, so "64" on
+a 16:9 source becomes 36x64, not 64x64.
+
+Refinement converges: error stops moving at about 200 steps (0.3190 at 200,
+0.3190 at 2000), so values above a few hundred cost time and change nothing.
+
 None of this edits any file inside your Wan2GP install; it's applied purely
 in-memory, once, and is safe to apply twice (idempotent) if the plugin is
 reloaded.

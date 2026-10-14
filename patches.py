@@ -1485,6 +1485,9 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         video_paths = [p for p in (spec.get("video_path"), spec.get("video_path2")) if p]
     audio_path = spec.get("audio_path") or None
     ref_resolution = int(spec.get("ref_resolution", 1024))
+    # Long edge of the frames shown to Qwen3-VL (the <Picture N> channel).
+    # 0 / missing = the module default, which is live-reference parity.
+    enc_resolution = int(spec.get("enc_resolution", 0)) or core.ENC_MAX_EDGE
     pool_h = int(spec.get("pool_h", 16))
     pool_w = int(spec.get("pool_w", 16))
     latent_frames = int(spec.get("latent_frames", 16))
@@ -1559,6 +1562,18 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         if pool_grid != (pool_h, pool_w):
             status(f"pooled grid {pool_h}x{pool_w} -> {pool_grid[0]}x{pool_grid[1]} to match source aspect")
     gh, gw = pool_grid if pool_grid is not None else (pool_h, pool_w)
+
+    # Extraction runs *before* the original generate(), so the pipeline's own
+    # _configure_tiling() has not run in this call -- on the very first task
+    # after a model load the VAE is still untiled, and a large source (a wide
+    # panorama, a 2048-short-edge photo) can exhaust VRAM in one encode.
+    # Enabling it here is exactly what generate() does a moment later, and is
+    # harmless when it is already on.
+    try:
+        pipeline_self._configure_tiling(None)
+    except Exception as e:
+        _log(f"could not enable VAE tiling before encoding ({e!r}); continuing untiled -- "
+             f"a very large reference image may run out of VRAM")
 
     frames = []
     n_img = n_vid = 0
@@ -1645,6 +1660,10 @@ def _run_extract_job(pipeline_self, spec: dict, set_progress_status=None) -> Non
         enc_frames=(torch.cat(enc_frames) if enc_frames else None),
         enc_times=enc_times, enc_layout=enc_layout,
         enc_fps=(FPS_ASSUMED_FOR_DURATION_ESTIMATE if enc_layout == core.ENC_LAYOUT_CLIP else 0.0),
+        # A clip stores up to ENC_MAX_CLIP_FRAMES views, so it keeps the
+        # smaller per-frame cap; a still spends its whole budget on one frame.
+        enc_max_edge=(min(enc_resolution, core.ENC_MAX_EDGE_CLIP)
+                      if enc_layout == core.ENC_LAYOUT_CLIP else enc_resolution),
         source="stack" if len(frames) > 1 else ("video" if n_vid else "image"),
         source_shape=" +".join(source_shapes),
         pool=(f"full-res {px_w}x{px_h}px (short-edge cap {ref_resolution}px)" if mode == "encode"
