@@ -56,6 +56,7 @@ import json
 import os
 import random
 import traceback
+import weakref
 from typing import Optional
 
 import torch
@@ -109,6 +110,42 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
         except Exception:
             pass
     return model_type.startswith("minimax_h3_ref2va")
+
+
+# RefMods on FL2VA (and finetunes built on it, such as VDN), and on the FL2VA
+# ControlNet-Union model, which is FL2VA plus a control branch. See the
+# "FL2VA support" section below for how mods reach a model that has no
+# reference inputs of its own.
+# Both can be turned off without editing code, for isolating a problem:
+#   set H3REFMOD_FL2VA=0        -> mods only work on Ref2VA, as before v0.39
+#   set H3REFMOD_CONTROLNET=0   -> FL2VA yes, the ControlNet model no
+FL2VA_REFMODS = os.environ.get("H3REFMOD_FL2VA", "1").strip() not in ("0", "false", "off")
+CONTROLNET_REFMODS = os.environ.get("H3REFMOD_CONTROLNET", "1").strip() not in ("0", "false", "off")
+
+# Architecture prefixes, from models/minimax_h3/minimax_h3_handler.py:
+# FL2VA_ARCHITECTURE / FL2VA_PRUNED_ARCHITECTURE = "minimax_h3_fl2va[_pruned]",
+# CONTROL_ARCHITECTURE / CONTROL_PRUNED_ARCHITECTURE = "minimax_h3_control[_pruned]".
+def _fl2va_family_prefixes():
+    return ("minimax_h3_fl2va",) + (("minimax_h3_control",) if CONTROLNET_REFMODS else ())
+
+
+def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
+    """Models RefMods can be used with: Ref2VA, plus FL2VA, its finetunes and
+    the FL2VA ControlNet model. Resolves finetunes to their real architecture
+    exactly as is_minimax_h3_ref2va does."""
+    if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
+        return True
+    model_type = str(model_type or "")
+    if not FL2VA_REFMODS or not model_type:
+        return False
+    if callable(get_base_model_type_fn):
+        try:
+            base = get_base_model_type_fn(model_type)
+            if base:
+                return str(base).startswith(_fl2va_family_prefixes())
+        except Exception:
+            pass
+    return model_type.startswith(_fl2va_family_prefixes())
 
 
 class _RefModImageSentinel:
@@ -242,7 +279,38 @@ _STATE_ATTR = "_h3refmod_gen_state"
 # helper with no `self`, so this is how the video path reaches that call's
 # bookkeeping. Generation is single-threaded per pipeline, so one slot is
 # enough; it is only ever read, never trusted to exist.
+#
+# It holds a *weak* reference, and generate() clears it in a finally. Both
+# matter: a plain reference here kept the whole H3 pipeline alive after the
+# generation ended -- transformer, text encoder, VAEs, everything -- so when
+# WanGP released the model its ~20 GiB of pinned RAM could not be given back,
+# and loading the next model hit the reserved-RAM ceiling and failed with a
+# CUDA out-of-memory. The weakref is the belt: even if some path ever skipped
+# the finally, nothing here can keep a model in memory again.
 _ACTIVE = {"pipeline": None}
+
+
+def _set_active_pipeline(pipeline_self):
+    """Make this pipeline reachable from the module-level helpers, weakly.
+    Returns the previous value so the caller can restore it -- generate() can
+    nest (phase-2 refinement calls back into it), and an inner call must not
+    leave the outer one without its pipeline."""
+    previous = _ACTIVE.get("pipeline")
+    try:
+        _ACTIVE["pipeline"] = weakref.ref(pipeline_self)
+    except TypeError:   # not weak-referenceable (no __weakref__ slot)
+        _ACTIVE["pipeline"] = None
+    return previous
+
+
+def _active_pipeline():
+    ref = _ACTIVE.get("pipeline")
+    if ref is None:
+        return None
+    try:
+        return ref()
+    except TypeError:   # a plain object from an older build of this module
+        return ref
 
 # Wan2GP's own native reference caps, enforced inline in generate() between
 # the reference-building loop and the point where `refs` is read. They are a
@@ -272,6 +340,22 @@ def _reset_gen_state(pipeline_self) -> dict:
 def _gen_state(pipeline_self) -> dict:
     state = getattr(pipeline_self, _STATE_ATTR, None)
     return state if isinstance(state, dict) else _reset_gen_state(pipeline_self)
+
+
+def _clear_gen_state(pipeline_self) -> None:
+    """Drop this call's bookkeeping once generate() has returned. It lives on
+    the pipeline, so it cannot keep the pipeline itself alive -- but it holds
+    RefMod latents (the overflow lists) and the pipeline's own `refs` lists,
+    and there is no reason for either to survive the generation."""
+    try:
+        delattr(pipeline_self, _STATE_ATTR)
+    except AttributeError:
+        pass
+    except Exception:
+        try:
+            setattr(pipeline_self, _STATE_ATTR, None)
+        except Exception:
+            pass
 
 
 def _place_refmod_ref(pipeline_self, sentinel, refs, entry) -> None:
@@ -636,7 +720,8 @@ def install_patches() -> Optional[str]:
     if _orig_prepare_condition_rows is not None:
         @functools.wraps(_orig_prepare_condition_rows)
         def patched_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs):
-            _restore_hidden_refs(self, visual_latents, audio_latents)
+            _restore_hidden_refs(self, visual_latents, audio_latents)   # Ref2VA route
+            _append_fl2va_rows(self, visual_latents, audio_latents)     # FL2VA route
             return _orig_prepare_condition_rows(self, visual_latents, audio_latents, generator, *args, **kwargs)
         Pipeline._prepare_condition_rows = patched_prepare_condition_rows
     else:
@@ -736,7 +821,7 @@ def install_patches() -> Optional[str]:
             # latent goes into the packed sequence at its own saved
             # resolution, exactly as it did before this step existed.
             if isinstance(video, _RefModVideoSentinel):
-                active = _ACTIVE.get("pipeline")
+                active = _active_pipeline()
                 if active is None or not _should_fit(active, width, height):
                     return video
                 fitted = _fit_latent_to_canvas(video.latent, width, height, 100.0, "video RefMod")
@@ -785,7 +870,7 @@ def install_patches() -> Optional[str]:
         # Fresh bookkeeping for this call -- every generate() (and every
         # sliding window, each of which is its own call) starts at phase 1.
         state = _reset_gen_state(self)
-        _ACTIVE["pipeline"] = self
+        previous_active = _set_active_pipeline(self)
         # The full output canvas for this call. Phase 1 of a two-phase run is
         # handed a *smaller* canvas (H3_TWO_PHASE_SCALE); comparing against
         # this is how _should_fit tells the phases apart, so single-phase and
@@ -795,15 +880,40 @@ def install_patches() -> Optional[str]:
         except (TypeError, ValueError):
             state["full_canvas"] = None
 
+        # Which of the two routes this model takes. FL2VA (and the FL2VA
+        # ControlNet model) has no reference inputs at all, so its mods are
+        # staged for the hooks rather than placed in kwargs.
+        _clear_fl2va()
+        fl2va = _is_fl2va_pipeline(self)
+
         # state_json was already read (and cleared if it turned out to carry an
         # extraction job) at the top of this function -- don't re-read it here.
         if state_json:
-            try:
-                kwargs = _inject_refmods(self, kwargs, state_json)
-            except Exception:
-                _log("could not inject RefMods, continuing without them:\n" + traceback.format_exc())
+            if fl2va:
+                try:
+                    _stage_fl2va_refmods(self, kwargs, state_json)
+                except Exception:
+                    _clear_fl2va()
+                    _log("could not stage RefMods for FL2VA, continuing without them:\n"
+                         + traceback.format_exc())
+            else:
+                try:
+                    kwargs = _inject_refmods(self, kwargs, state_json)
+                except Exception:
+                    _log("could not inject RefMods, continuing without them:\n" + traceback.format_exc())
 
-        return _orig_generate(self, *args, **kwargs)
+        try:
+            return _orig_generate(self, *args, **kwargs)
+        finally:
+            # Nothing of this generation may outlive it. Anything still held
+            # here keeps the whole pipeline -- and with it ~20 GiB of pinned
+            # transformer RAM -- alive after WanGP releases the model, which
+            # then cannot load the next one.
+            _clear_fl2va()                      # staged mod latents
+            _ACTIVE["pipeline"] = previous_active   # restore, for a nested generate()
+            _clear_gen_state(self)              # overflow latents from this call
+
+    _install_fl2va_hooks(Pipeline)   # _encode_prompt, _prepare_control_rows, transformer forward
 
     Pipeline._add_image_reference = patched_add_image_reference
     Pipeline._add_video_reference = patched_add_video_reference
@@ -844,8 +954,8 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
     The original function's behavior is fully preserved for every other
     model, and for MiniMax H3 whenever the panel's selection is empty.
     ``get_base_model_type_fn`` (see ``is_minimax_h3_ref2va``) makes this
-    correctly recognize a MiniMax H3 Ref2VA finetune even when its own
-    model_type name doesn't start with "minimax_h3_ref2va".
+    correctly recognize a MiniMax H3 finetune even when its own model_type
+    name doesn't start with its base architecture's name.
     """
     if getattr(install_prepare_inputs_dict_patch, _PREPARE_INPUTS_PATCH_MARKER, False):
         return None
@@ -856,7 +966,7 @@ def install_prepare_inputs_dict_patch(orig_prepare_inputs_dict, get_state_model_
         try:
             if isinstance(state, dict) and isinstance(result, dict):
                 resolved_type = model_type or get_state_model_type_fn(state)
-                if is_minimax_h3_ref2va(resolved_type, get_base_model_type_fn):
+                if is_minimax_h3_refmod_capable(resolved_type, get_base_model_type_fn):
                     stash = state.get(STASH_KEY)
                     existing = dict(result.get("custom_settings") or {})
                     if stash:
@@ -906,8 +1016,8 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
     possible moment before it's queued. Every other model, and MiniMax H3
     with an empty selection, are returned completely unchanged.
     ``get_base_model_type_fn`` (see ``is_minimax_h3_ref2va``) makes this
-    correctly recognize a MiniMax H3 Ref2VA finetune even when its own
-    model_type name doesn't start with "minimax_h3_ref2va".
+    correctly recognize a MiniMax H3 finetune even when its own model_type
+    name doesn't start with its base architecture's name.
     """
     if getattr(install_get_model_settings_patch, _GET_MODEL_SETTINGS_PATCH_MARKER, False):
         return None
@@ -916,7 +1026,7 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
         settings = orig_get_model_settings(state, model_type)
         try:
             if (isinstance(settings, dict) and isinstance(state, dict)
-                    and is_minimax_h3_ref2va(model_type, get_base_model_type_fn)):
+                    and is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn)):
                 stash = state.get(STASH_KEY)
                 existing = dict(settings.get("custom_settings") or {})
                 if stash:
@@ -950,19 +1060,27 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # Generation-time injection
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
-    window_no = kwargs.get("window_no")
+def _build_refmod_sentinels(pipeline_self, state_json, window_no, image_output):
+    """Parse a saved selection and turn it into sentinels, ready to be placed.
+
+    Shared by the two routes a mod can take into a generation: the Ref2VA one
+    (_inject_refmods, which hands them to generate()'s own reference inputs)
+    and the FL2VA one (_stage_fl2va_refmods, which cannot use those inputs at
+    all -- see the "FL2VA support" section). Returns
+    ``(image, video, audio, total_tokens, retention, window_mode)`` or None
+    when there is nothing to inject.
+    """
     later_window = isinstance(window_no, int) and window_no > 1
     try:
         state = json.loads(state_json)
     except Exception as e:
         _log(f"could not parse RefMod state ({e!r}); ignoring")
-        return kwargs
+        return None
     if EXTRACT_WRAPPER_KEY in state:
-        return kwargs  # an extraction spec, not a mod selection (already handled upstream)
+        return None  # an extraction spec, not a mod selection (already handled upstream)
     rows = state.get("rows") or []
     if not rows:
-        return kwargs
+        return None
     retention = float(state.get("retention", 1.0))
     curve = state.get("curve")  # [direction, shape, value] or None
     if isinstance(curve, list):
@@ -987,7 +1105,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
         loaded_rows.append((mod, strength, copies))
 
     if not loaded_rows:
-        return kwargs
+        return None
 
     if seed >= 0 and len(loaded_rows) > 1:
         rng = random.Random(seed)
@@ -1058,7 +1176,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
             audio_sentinels.append(sentinel)
 
     if not image_sentinels and not video_sentinels and not audio_sentinels:
-        return kwargs
+        return None
 
     # Image / single-frame output: a reference *video* has no place to go.
     # WanGP handles its own live case by folding only the first reference
@@ -1069,16 +1187,30 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     # here, that same code would keep the first one and silently drop any
     # others. Convert them ourselves instead -- one still reference per mod,
     # from its first latent frame, exactly what the image path can use.
-    if int(kwargs.get("image_mode") or 0) > 0 and not getattr(pipeline_self, "audio_only", False):
-        if video_sentinels:
-            for sentinel in video_sentinels:
-                still = _RefModImageSentinel(sentinel.latent[:, :, :1])
-                still.enc = _enc_as_still(sentinel.enc)
-                image_sentinels.append(still)
-            _log(f"image output mode: {len(video_sentinels)} video-kind RefMod(s) converted to "
-                 f"still image references (first frame each) -- a reference video has no meaning "
-                 f"for a single-frame output, and WanGP would otherwise keep only the first one.")
-            video_sentinels = []
+    if image_output and video_sentinels:
+        for sentinel in video_sentinels:
+            still = _RefModImageSentinel(sentinel.latent[:, :, :1])
+            still.enc = _enc_as_still(sentinel.enc)
+            image_sentinels.append(still)
+        _log(f"image output mode: {len(video_sentinels)} video-kind RefMod(s) converted to "
+             f"still image references (first frame each) -- a reference video has no meaning "
+             f"for a single-frame output, and WanGP would otherwise keep only the first one.")
+        video_sentinels = []
+
+    return (image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode)
+
+
+def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
+    """The Ref2VA route: place the mods in generate()'s own reference inputs."""
+    window_no = kwargs.get("window_no")
+    built = _build_refmod_sentinels(
+        pipeline_self, state_json, window_no,
+        image_output=(int(kwargs.get("image_mode") or 0) > 0
+                      and not getattr(pipeline_self, "audio_only", False)))
+    if built is None:
+        return kwargs
+    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, window_mode = built
+    later_window = isinstance(window_no, int) and window_no > 1
 
     state = _gen_state(pipeline_self)
 
@@ -1202,6 +1334,280 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
          f"{len(audio_sentinels)} audio-kind RefMod reference(s), "
          f"retention={retention:.2f} (~{total_tokens} tokens){where}")
     return kwargs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FL2VA support
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The Ref2VA route cannot work on FL2VA: the pipeline is built with
+# reference_mode=False, which skips every reference-building step, and any
+# value left in input_ref_images / input_frames raises
+#   "Image, video, and audio references require the Ref2VA checkpoint"
+# (pipeline.py, in generate()).
+#
+# The transformer itself, though, is model-agnostic. MiniMaxH3Model._layout
+# picks build_ref2va_packed_sequence purely on payload["refs"] being
+# non-empty, and that packer already accepts first/last-frame keyframe
+# anchors alongside references -- so FL2VA's own start/end frames survive.
+# The ComfyUI original relies on exactly this: its Apply node appends ref
+# blocks to whatever conditioning it is given, FL2VA included.
+#
+# So on FL2VA the mods bypass generate()'s reference inputs entirely:
+#   * their latents are appended to the condition latents inside
+#     _prepare_condition_rows (phase 1, plain phase 2, and tiled phase 2,
+#     which appends reference rows whole to every tile), and
+#   * payload["refs"] is filled in at the top of the transformer's forward
+#     whenever generate() left it empty -- phase 1 builds it as None and both
+#     phase-2 paths reset it to None.
+#
+# The ControlNet model's control rows carry one blank row per condition row
+# ahead of the video, and that block is built from condition_latents BEFORE
+# the mods are appended, so _prepare_control_rows is patched to count them
+# too -- otherwise _control_stream raises "control rows must match the packed
+# video rows".
+
+_FL2VA = {"active": False, "visual": [], "audio": [], "entries": [], "announced": False,
+          "presentation": [], "visual2": [], "entries2": [], "calls": 0, "pass_no": 1,
+          "labels_logged": False}
+
+
+def _clear_fl2va() -> None:
+    _FL2VA.update(active=False, visual=[], audio=[], entries=[], announced=False, presentation=[],
+                  visual2=[], entries2=[], calls=0, pass_no=1, labels_logged=False)
+
+
+def _transformer_has_control(transformer) -> bool:
+    """Control checkpoints attach a ControlBlock to their DiT blocks; FL2VA
+    (and FL2VA finetunes such as VDN) do not."""
+    try:
+        return any(getattr(block, "control", None) is not None
+                   for block in getattr(transformer, "blocks", None) or ())
+    except Exception:
+        return False
+
+
+def _is_fl2va_pipeline(pipeline_self) -> bool:
+    """A loaded pipeline that takes the FL2VA route: not reference_mode (so
+    Ref2VA is excluded), not Viggle's fixed-prompt mode, not audio-only."""
+    return (FL2VA_REFMODS
+            and not getattr(pipeline_self, "reference_mode", False)
+            and getattr(pipeline_self, "fixed_prompt", None) is None
+            and not getattr(pipeline_self, "audio_only", False)
+            and (CONTROLNET_REFMODS
+                 or not _transformer_has_control(getattr(pipeline_self, "transformer", None))))
+
+
+def _phase_1_canvas(out_w, out_h):
+    """What pipeline.generate() reduces the canvas to for phase 1 of a
+    two-phase run: round(size / H3_TWO_PHASE_SCALE / 32) * 32, floor 32."""
+    return (max(32, round(int(out_w) / 2.0 / 32) * 32),
+            max(32, round(int(out_h) / 2.0 / 32) * 32))
+
+
+def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
+    """Load the selection and stage it for the FL2VA hooks. Order matters:
+    the packer assigns condition rows to references in list order, so the
+    entries are built in exactly the order their latents get appended."""
+    built = _build_refmod_sentinels(
+        pipeline_self, state_json, kwargs.get("window_no"),
+        image_output=(int(kwargs.get("image_mode") or 0) > 0
+                      and not getattr(pipeline_self, "audio_only", False)))
+    if built is None:
+        return False
+    image_sentinels, video_sentinels, audio_sentinels, total_tokens, retention, _mode = built
+
+    # FL2VA cannot size mods inside generate() the way the Ref2VA hooks do
+    # (those run per reference, from the canvas that phase was handed), so
+    # each pass gets its own copy, sized up front.
+    out_w, out_h = kwargs.get("width"), kwargs.get("height")
+    two_phase = int(kwargs.get("guide_phases") or 1) > 1 and kwargs.get("frozen_control_video") is None
+
+    def sized(latent, label, pass_no):
+        if not (two_phase and pass_no == 1) or not out_w or not out_h:
+            return latent
+        cw, ch = _phase_1_canvas(out_w, out_h)
+        return _fit_latent_to_canvas(latent, cw, ch, 100.0, f"{label} RefMod")
+
+    def build_pass(pass_no):
+        visual, entries = [], []
+        for sentinel in image_sentinels:
+            latent = sized(sentinel.latent, "image", pass_no)
+            visual.append(latent)
+            entries.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
+        for sentinel in video_sentinels:
+            latent = sized(sentinel.latent, "video", pass_no)
+            visual.append(latent)
+            entries.append({"kind": "video", "latent_t": latent.shape[2], "latent_h": latent.shape[-2],
+                            "latent_w": latent.shape[-1], "ref_audio_t": 0})
+        # Phase 2 reuses phase 1's audio rows, so every audio entry stays.
+        for sentinel in audio_sentinels:
+            entries.append({"kind": "audio", "ref_audio_t": sentinel.latent.shape[-1]})
+        return visual, entries
+
+    visual, entries = build_pass(1)
+    visual2, entries2 = build_pass(2) if two_phase else (visual, entries)
+
+    labels = []
+    if PROMPT_LABELS_FOR_REFMODS:
+        # In the order the references are packed: pictures, videos, then audio.
+        labels = [s.enc for s in image_sentinels + video_sentinels if isinstance(s.enc, dict)]
+        labels += [{"type": "audio"} for _ in audio_sentinels]
+
+    _FL2VA.update(active=True, visual=visual, audio=[s.latent for s in audio_sentinels],
+                  entries=entries, announced=False, presentation=labels, visual2=visual2,
+                  entries2=entries2, calls=0, pass_no=1, labels_logged=False)
+    _log(f"FL2VA: staging {len(image_sentinels)} image-kind + {len(video_sentinels)} video-kind + "
+         f"{len(audio_sentinels)} audio-kind RefMod reference(s), retention={retention:.2f} "
+         f"(~{total_tokens} tokens)")
+    return True
+
+
+def _append_fl2va_rows(pipeline_self, visual_latents, audio_latents) -> None:
+    """From _prepare_condition_rows: add the staged mods to this pass's
+    condition latents. Audio only on the first pass -- both phase-2 paths
+    pass a throwaway [] for audio and keep phase 1's audio rows."""
+    if (not _FL2VA["active"] or getattr(pipeline_self, "reference_mode", False)
+            or not isinstance(visual_latents, list)):
+        return
+    first_pass = _FL2VA["calls"] == 0
+    _FL2VA["calls"] += 1
+    _FL2VA["pass_no"] = 1 if first_pass else 2
+    visual_latents.extend(_FL2VA["visual"] if first_pass else _FL2VA["visual2"])
+    if first_pass and isinstance(audio_latents, list):
+        audio_latents.extend(_FL2VA["audio"])
+
+
+def _fl2va_report(model, payload, video_x, audio_x) -> None:
+    """One-shot row accounting, printed the first time a pass reaches the
+    transformer. Everything here is derived the same way the real packer and
+    the real row assembly do it, so a disagreement on any line is a concrete
+    bug rather than a guess. Purely diagnostic -- it changes nothing."""
+    try:
+        patch = tuple(getattr(model, "patch_size", (1, 2, 2)))
+        text_len = int(payload["text_token_tags"].view(-1).numel())
+        refs = payload.get("refs") or ()
+        keyframes = payload.get("keyframes") or ()
+        _, _, latent_t, latent_h, latent_w = video_x.shape
+        rows_per_target = (latent_h // patch[1]) * (latent_w // patch[2])
+
+        keyframe_rows = sum(int(k.get("latent_frame_count", 1)) for k in keyframes) * rows_per_target
+        ref_video_rows = sum(int(r.get("latent_t", 1)) * (int(r.get("latent_h", 0)) // patch[1])
+                             * (int(r.get("latent_w", 0)) // patch[2])
+                             for r in refs if r.get("kind") != "audio")
+        ref_audio_rows = sum(int(r.get("ref_audio_t", 0)) * 2 for r in refs)
+        keyframe_audio_rows = sum(int(k.get("latent_frame_count", 1))
+                                  for k in (payload.get("audio_keyframes") or ())) * 2
+
+        cond_video = payload.get("cond_video_rows")
+        cond_audio = payload.get("cond_audio_rows")
+        fed_video = 0 if cond_video is None else int(cond_video.shape[0])
+        fed_audio = 0 if cond_audio is None else int(cond_audio.shape[0])
+        want_video = keyframe_rows + ref_video_rows
+        want_audio = keyframe_audio_rows + ref_audio_rows
+
+        target_video = latent_t * rows_per_target
+        target_audio = int(audio_x.shape[-1]) * 2
+
+        _log(f"FL2VA check | text {text_len} | keyframes {len(keyframes)} ({keyframe_rows} rows) "
+             f"| refs {len(refs)} ({ref_video_rows} video + {ref_audio_rows} audio rows) "
+             f"| target {target_video} video + {target_audio} audio")
+        ok_v = fed_video == want_video
+        ok_a = fed_audio == want_audio
+        _log(f"FL2VA check | condition video rows fed {fed_video} vs packer expects {want_video} "
+             f"-> {'OK' if ok_v else 'MISMATCH'}")
+        _log(f"FL2VA check | condition audio rows fed {fed_audio} vs packer expects {want_audio} "
+             f"-> {'OK' if ok_a else 'MISMATCH'}")
+        if not (ok_v and ok_a):
+            _log("FL2VA check | the condition rows and the packed layout disagree -- this WILL "
+                 "produce a broken render. Please report these lines.")
+        ctrl = payload.get("control_rows")
+        if ctrl is not None:
+            _log(f"FL2VA check | control rows {int(ctrl.shape[0])} vs video rows "
+                 f"{want_video + target_video} -> "
+                 f"{'OK' if int(ctrl.shape[0]) == want_video + target_video else 'MISMATCH'}")
+    except Exception:
+        _log("FL2VA check: could not compute the row report (diagnostic only):\n"
+             + traceback.format_exc())
+
+
+_FL2VA_HOOKS_MARKER = "_h3refmod_fl2va_hooks"
+
+
+def _install_fl2va_hooks(Pipeline) -> None:
+    if not FL2VA_REFMODS or getattr(Pipeline, _FL2VA_HOOKS_MARKER, False):
+        return
+    setattr(Pipeline, _FL2VA_HOOKS_MARKER, True)
+
+    _orig_encode_prompt = getattr(Pipeline, "_encode_prompt", None)
+    if _orig_encode_prompt is not None:
+        @functools.wraps(_orig_encode_prompt)
+        def patched_encode_prompt(self, prompt, presentation, *args, **kwargs):
+            # FL2VA builds its presentation from its own keyframes; the staged
+            # labels go *after* them, so a start frame stays <Picture 1>.
+            if _FL2VA["active"] and _FL2VA.get("presentation") and isinstance(presentation, list):
+                presentation.extend(_FL2VA["presentation"])
+                if not _FL2VA.get("labels_logged"):
+                    _FL2VA["labels_logged"] = True
+                    counts = {"image": 0, "video": 0, "audio": 0}
+                    names = {"image": "Picture", "video": "Video", "audio": "Audio"}
+                    named = []
+                    for item in presentation:
+                        kind = item.get("type")
+                        if kind in counts:
+                            counts[kind] += 1
+                            if any(item is ours for ours in _FL2VA["presentation"]):
+                                named.append(f"<{names[kind]} {counts[kind]}>")
+                    _log("FL2VA: RefMods in the prompt as " + (", ".join(named) or "none"))
+            return _orig_encode_prompt(self, prompt, presentation, *args, **kwargs)
+        Pipeline._encode_prompt = patched_encode_prompt
+
+    _orig_prepare_control_rows = getattr(Pipeline, "_prepare_control_rows", None)
+    if _orig_prepare_control_rows is not None and CONTROLNET_REFMODS:
+        @functools.wraps(_orig_prepare_control_rows)
+        def patched_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                         height, width, condition_latents, *args, **kwargs):
+            # One blank control row per condition row. The mods are appended to
+            # the condition latents later (in _prepare_condition_rows), so this
+            # block has to account for them here or the two row counts diverge.
+            if _FL2VA["active"] and _FL2VA["visual"] and isinstance(condition_latents, (list, tuple)):
+                condition_latents = list(condition_latents) + list(_FL2VA["visual"])
+                _log(f"FL2VA ControlNet: control rows padded for {len(_FL2VA['visual'])} "
+                     f"RefMod reference(s)")
+            return _orig_prepare_control_rows(self, control_frames, masks, frame_anchors, frame_count,
+                                              height, width, condition_latents, *args, **kwargs)
+        Pipeline._prepare_control_rows = patched_prepare_control_rows
+
+    try:
+        from models.minimax_h3 import transformer as h3_transformer
+        Model = h3_transformer.MiniMaxH3Model
+    except Exception as e:
+        _log(f"could not reach MiniMaxH3Model ({e!r}); RefMods will not work on FL2VA. "
+             f"Ref2VA is unaffected.")
+        return
+    if getattr(Model, _FL2VA_HOOKS_MARKER, False):
+        return
+    setattr(Model, _FL2VA_HOOKS_MARKER, True)
+    _orig_forward = Model.forward
+
+    @functools.wraps(_orig_forward)
+    def patched_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
+                        *args, **kwargs):
+        # Only ever fills a payload generate() left empty, so a Ref2VA run --
+        # which sets payload["refs"] itself -- is never touched.
+        if _FL2VA["active"] and _FL2VA["entries"] and isinstance(payload, dict) and not payload.get("refs"):
+            payload["refs"] = list(_FL2VA["entries2"] if _FL2VA["pass_no"] == 2 else _FL2VA["entries"])
+            if not _FL2VA["announced"]:
+                _FL2VA["announced"] = True
+                _log(f"FL2VA: {len(payload['refs'])} RefMod reference(s) attached to the "
+                     f"transformer payload (pass {_FL2VA['pass_no']}) -- the reference-aware "
+                     f"packer is now in use")
+                _fl2va_report(self, payload, video_x, audio_x)
+        return _orig_forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload,
+                             *args, **kwargs)
+
+    Model.forward = patched_forward
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════

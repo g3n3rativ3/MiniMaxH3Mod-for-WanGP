@@ -683,6 +683,92 @@ load time:
    slots are ever filled, and relabels its prompt entry `<Picture N>` rather
    than `<Video N>`, matching the single still the DiT actually receives.
 
+## The pipeline is never held after a generation
+
+Nothing in this plugin may outlive the generation it belongs to. A module-level
+reference to the H3 pipeline keeps the whole model graph alive -- transformer,
+text encoder, both VAEs, the vision encoder, the latent upscaler -- so when
+WanGP releases the model, MMGP cannot give back its pinned RAM (around 20 GiB
+for a pruned H3 transformer). Loading the next model then runs into the
+reserved-RAM ceiling and fails with a CUDA out-of-memory that looks like it
+came from somewhere else entirely.
+
+That is exactly what `_ACTIVE["pipeline"]` did between v0.34.0 and v0.39.1. It
+exists because `_resize_video` is a module-level helper with no `self`, so the
+video path needs some way to reach the current call's bookkeeping. It is now:
+
+- a **weak** reference, so it can never keep a model alive even if a path ever
+  skipped the cleanup;
+- **restored to its previous value** in a `finally` around `generate()`, rather
+  than simply cleared, because generate() can nest and an inner call must not
+  leave the outer one without its pipeline.
+
+The per-call state on the pipeline (`_h3refmod_gen_state`) is dropped in the
+same `finally`. It never held the pipeline -- it lives *on* it -- but it does
+hold RefMod latents, and those have no reason to survive the generation either.
+
+`bench/leak.py` is the regression test: it runs a generation, drops every
+reference the way WanGP does when releasing a model, and asserts the pipeline
+is collected, for Ref2VA and FL2VA, single-phase and two-phase.
+
+## FL2VA and FL2VA ControlNet
+
+RefMods work on FL2VA, its finetunes (VDN and others) and the FL2VA
+ControlNet-Union model, not only on Ref2VA. The route is necessarily
+different, because FL2VA has no reference inputs at all: its pipeline is
+built with `reference_mode=False`, and anything left in `input_ref_images` or
+`input_frames` raises *"Image, video, and audio references require the Ref2VA
+checkpoint"*.
+
+The transformer, though, is model-agnostic. `MiniMaxH3Model._layout` picks
+`build_ref2va_packed_sequence` purely on `payload["refs"]` being non-empty,
+and that packer already accepts first/last-frame keyframe anchors alongside
+references -- so FL2VA's own start and end frames survive untouched. The
+ComfyUI original relies on exactly this: its Apply node appends ref blocks to
+whatever conditioning it is handed, FL2VA included.
+
+So on FL2VA the mods bypass `generate()`'s reference inputs entirely:
+
+- their latents are appended to the condition latents inside
+  `_prepare_condition_rows` (phase 1, plain phase 2, and tiled phase 2, which
+  appends reference rows whole to every tile);
+- `payload["refs"]` is filled at the top of the transformer's `forward`,
+  but only when `generate()` left it empty -- phase 1 builds it as `None` and
+  both phase-2 paths reset it to `None`, while a Ref2VA run fills it itself
+  and is never touched;
+- prompt labels are appended to the presentation *after* FL2VA's own
+  keyframes, so a start frame keeps `<Picture 1>` and the mods follow it.
+
+**ControlNet** needs one more thing. Its control rows carry one blank row per
+condition row ahead of the video, and that block is built from
+`condition_latents` *before* the mods are appended, so `_prepare_control_rows`
+is patched to count them too. Without it the two row counts diverge and
+`_control_stream` raises *"control rows must match the packed video rows"*.
+
+Two-phase runs are handled up front rather than per reference: FL2VA cannot
+size a mod inside `generate()` the way the Ref2VA hooks do, so each pass gets
+its own copy, phase 1's fitted to the half-size canvas.
+
+Staged mods are cleared in a `finally` around `generate()`, so nothing can
+leak into the next generation. Each half can be turned off without editing code, which is the first thing to
+try if an FL2VA render misbehaves:
+
+```
+set H3REFMOD_FL2VA=0        # mods only on Ref2VA, exactly as before v0.39
+set H3REFMOD_CONTROLNET=0   # FL2VA yes, the ControlNet model no
+```
+
+The first time each pass reaches the transformer, the plugin prints a
+`[H3RefMod] FL2VA check | ...` row report: the condition rows it fed against
+what the packer expects, derived the same way the real packer and the real row
+assembly derive them. If any line says MISMATCH, that is a concrete bug and
+those lines identify it.
+
+This ports the FL2VA support from the
+[Refmod-Fork](https://github.com/jedsdead/Refmod-Fork) by jedsdead; the fork's
+other additions (per-mod size limits, phase-2 options, the Decompile tab,
+voice mods) are not included here.
+
 ## The two channels a RefMod feeds, and what each one's resolution control does
 
 A mod conditions the model through **two separate circuits**, and each has its
