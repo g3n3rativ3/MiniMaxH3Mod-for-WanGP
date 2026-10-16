@@ -683,6 +683,44 @@ load time:
    slots are ever filled, and relabels its prompt entry `<Picture N>` rather
    than `<Video N>`, matching the single still the DiT actually receives.
 
+## Two-phase: how a mod reaches phase 1
+
+Phase 1 of a two-phase run renders at half resolution, and point 20 below
+fits mods to that smaller canvas. Two settings in the panel control *how*,
+both ported from the [Refmod-Fork](https://github.com/jedsdead/Refmod-Fork)
+and both inert on a single-phase run and in phase 2, which get the full
+canvas.
+
+**Shrink method** (default: Re-encode). Only used when something shrinks a
+mod -- which, with *Mods in phase 1* left on its default, no longer happens on
+an ordinary two-phase run. The original fit averaged VAE latent
+cells (`F.interpolate(..., mode="area")`). That is not the same operation as
+shrinking the picture: averaging latent cells blurs fine detail, and a face is
+the first thing to go. Re-encode instead decodes the mod, resizes the
+**pixels** with the pipeline's own `_resize_video`, and encodes again with the
+generation's VAE. Both land on exactly the same latent size -- the arithmetic
+is shared (`_fit_target_cells`) -- only the resampling differs. It costs one
+VAE round trip per mod and target size, cached (16 entries), and falls back to
+the resample if anything goes wrong, so a pipeline that cannot decode still
+produces a fitted reference instead of failing. Picture mods are rebuilt one
+latent frame at a time: a stack of stills was encoded as separate pictures,
+and decoding it as a clip would smear them together.
+
+**Mods in phase 1** (default: Full size). The mod is left at its extracted
+size in phase 1 rather than fitted to the half canvas. Phase 1 is where a
+two-phase run settles identity -- phase 2 restarts from
+`H3_PHASE_2_NOISE_LEVEL_START` (0.9035) and only refines -- so a mod that
+arrives there soft has little left to give.
+
+It does cost several times the reference tokens: measured on a 90x160 mod,
+405 fitted against 3600 full at a 1280x1280 output (**9x**), and 16x for a
+2560x1440 mod at 1280x720. Those multiples sound worse than they are. The
+reference is a small part of a packed sequence whose target video alone runs
+to tens of thousands of rows, and in practice the extra does not show up as a
+measurable slowdown -- which is why this is the default rather than the
+cautious option. *Fit to phase 1's canvas* is there for when it does show up,
+and then *Shrink method* decides how.
+
 ## The pipeline is never held after a generation
 
 Nothing in this plugin may outlive the generation it belongs to. A module-level

@@ -70,6 +70,20 @@ WINDOW_MODE_CHOICES = [
 ]
 WINDOW_MODE_DEFAULT = "still"
 
+# How a mod is fitted to phase 1's half-size canvas on a two-phase run. Both
+# are inert on a single-phase run and in phase 2, which get the full canvas.
+# See patches.SHRINK_* / PHASE1_* for what each one does.
+SHRINK_METHOD_CHOICES = [
+    ("Re-encode (recommended)", "reencode"),
+    ("Fast (resample the latent)", "fast"),
+]
+SHRINK_METHOD_DEFAULT = "reencode"
+PHASE1_MODS_CHOICES = [
+    ("Full size (recommended)", "full"),
+    ("Fit to phase 1's canvas", "fit"),
+]
+PHASE1_MODS_DEFAULT = "full"
+
 # Mirrors models/minimax_h3/minimax_h3_handler.py -- kept as a local constant
 # so this UI doesn't need a live import of Wan2GP internals just to draw a
 # dropdown. If a future Wan2GP version changes these, only this dropdown's
@@ -354,6 +368,18 @@ def _default_model_choice(model_choices):
     return model_choices[0][1] if model_choices else None
 
 
+def _panel_options(extra):
+    """The non-row widgets _build_mod_picker_rows appends, read back by
+    position: window mode, shrink method, phase-1 mods. Missing values fall
+    back to their defaults, so an older layout keeps working."""
+    def pick(index, default):
+        value = extra[index] if len(extra) > index else None
+        return value or default
+    return {"window_mode": pick(0, WINDOW_MODE_DEFAULT),
+            "shrink_method": pick(1, SHRINK_METHOD_DEFAULT),
+            "phase1_mods": pick(2, PHASE1_MODS_DEFAULT)}
+
+
 def _library_rows(folder=None):
     """Table rows for the Library tab. ``folder`` follows the same picker
     convention as _mod_choices: None/ALL_FOLDERS_CHOICE lists every mod in
@@ -397,7 +423,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.40.0"
+        self.version = "0.42.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -518,9 +544,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 mdd, strength = vals[i * 2], vals[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:
                     rows.append({"mod": mdd, "strength": float(strength)})
-            window_mode = vals[n_rows * 2] if len(vals) > n_rows * 2 else WINDOW_MODE_DEFAULT
+            extra = list(vals[n_rows * 2:])
             payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
-                       "window_mode": window_mode or WINDOW_MODE_DEFAULT}
+                       **_panel_options(extra)}
             if not isinstance(state, dict):
                 return state, "⚠️ Could not access session state -- try reloading the page."
             if rows:
@@ -627,6 +653,21 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         for w in row_widgets:
             w.change(fn=update_counter, inputs=row_widgets, outputs=[counter], queue=False)
 
+        with gr.Row():
+            shrink_method = gr.Dropdown(
+                label="Shrink method (two-phase)", choices=SHRINK_METHOD_CHOICES,
+                value=SHRINK_METHOD_DEFAULT, scale=1,
+                info="Only used when something shrinks a mod (Mods in phase 1 set to Fit). "
+                     "Re-encode decodes it, resizes the picture and encodes it again -- averaging "
+                     "latent cells instead blurs fine detail, faces first.")
+            phase1_mods = gr.Dropdown(
+                label="Mods in phase 1 (two-phase)", choices=PHASE1_MODS_CHOICES,
+                value=PHASE1_MODS_DEFAULT, scale=1,
+                info="Phase 1 renders at half resolution and is where identity is settled, so a "
+                     "mod is left at its extracted size there by default. It costs several times "
+                     "more reference tokens, which in practice is a small share of the sequence. "
+                     "Fit shrinks it instead -- try that if phase 1 gets slow.")
+
         window_mode = gr.Dropdown(
             label="Video mods on sliding windows 2, 3, ...",
             choices=WINDOW_MODE_CHOICES, value=WINDOW_MODE_DEFAULT,
@@ -636,10 +677,11 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                  "own frames can surface at the window boundary. 'First frame as a still' keeps "
                  "the identity without the motion that causes that.")
 
-        # Appended as a one-element pseudo-row so both callers (inline panel
-        # and the plugin's own Generate tab) pick it up through the same flat
-        # widget list; each reads it back at index IMAGE_ROWS+VIDEO_ROWS+AUDIO_ROWS)*2.
-        return mod_rows + [(window_mode,)]
+        # Appended as one-element pseudo-rows so both callers (inline panel and
+        # the plugin's own Generate tab) pick them up through the same flat
+        # widget list, from index (IMAGE_ROWS+VIDEO_ROWS+AUDIO_ROWS)*2 on, in
+        # this order.
+        return mod_rows + [(window_mode,), (shrink_method,), (phase1_mods,)]
 
     def _build_extract_section(self, api_session, model_dd):
         gr.Markdown("### Extract a RefMod\n"
@@ -1103,9 +1145,9 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
                 mdd, strength = row_values[i * 2], row_values[i * 2 + 1]
                 if mdd and mdd != NONE_CHOICE and strength > 0:
                     rows.append({"mod": mdd, "strength": float(strength)})
-            window_mode = row_values[n_rows * 2] if len(row_values) > n_rows * 2 else WINDOW_MODE_DEFAULT
+            extra = list(row_values[n_rows * 2:])
             state_payload = {"rows": rows, "retention": 1.0, "scramble_seed": -1, "curve": None,
-                             "window_mode": window_mode or WINDOW_MODE_DEFAULT}
+                             **_panel_options(extra)}
 
             overrides = dict(synced_settings or {})
             overrides.update({

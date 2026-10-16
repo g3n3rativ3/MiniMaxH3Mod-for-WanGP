@@ -51,6 +51,7 @@ time to the already-loaded ``MiniMaxH3Pipeline`` class, and is idempotent
 
 from __future__ import annotations
 
+import collections
 import functools
 import json
 import os
@@ -628,8 +629,8 @@ def install_patches() -> Optional[str]:
     def patched_add_image_reference(self, image, target_width, target_height,
                                      image_refs_relative_size, presentation, visual_latents, refs):
         if isinstance(image, _RefModImageSentinel):
-            latent = (_fit_latent_to_canvas(image.latent, target_width, target_height,
-                                            image_refs_relative_size, "image RefMod")
+            latent = (_fit_mod_to_phase_1(self, image.latent, target_width, target_height,
+                                          image_refs_relative_size, "image", "image RefMod")
                       if _should_fit(self, target_width, target_height) else image.latent)
             _present_refmod(presentation, image)
             visual_latents.append(latent)
@@ -646,8 +647,8 @@ def install_patches() -> Optional[str]:
             # '_RefModVideoSentinel'"), so use the clip's first frame as a
             # still image reference instead -- a valid single-frame latent, and
             # the closest thing to what was asked for.
-            latent = (_fit_latent_to_canvas(image.latent[:, :, :1], target_width, target_height,
-                                            image_refs_relative_size, "video RefMod (as still)")
+            latent = (_fit_mod_to_phase_1(self, image.latent[:, :, :1], target_width, target_height,
+                                          image_refs_relative_size, "image", "video RefMod (as still)")
                       if _should_fit(self, target_width, target_height) else image.latent[:, :, :1])
             image.enc = _enc_as_still(image.enc)  # one still latent -> "<Picture N>", not "<Video N>"
             _present_refmod(presentation, image)
@@ -824,7 +825,8 @@ def install_patches() -> Optional[str]:
                 active = _active_pipeline()
                 if active is None or not _should_fit(active, width, height):
                     return video
-                fitted = _fit_latent_to_canvas(video.latent, width, height, 100.0, "video RefMod")
+                fitted = _fit_mod_to_phase_1(active, video.latent, width, height, 100.0,
+                                             "video", "video RefMod")
                 if fitted is video.latent:
                     return video
                 shrunk = _RefModVideoSentinel(fitted)
@@ -879,6 +881,11 @@ def install_patches() -> Optional[str]:
             state["full_canvas"] = (int(kwargs.get("width")), int(kwargs.get("height")))
         except (TypeError, ValueError):
             state["full_canvas"] = None
+        # How mods are fitted to phase 1's canvas, from the panel's selection.
+        state["shrink_method"] = _state_option(state_json, "shrink_method", SHRINK_DEFAULT,
+                                               (SHRINK_REENCODE, SHRINK_FAST))
+        state["phase1_mods"] = _state_option(state_json, "phase1_mods", PHASE1_DEFAULT,
+                                             (PHASE1_FIT, PHASE1_FULL))
 
         # Which of the two routes this model takes. FL2VA (and the FL2VA
         # ControlNet model) has no reference inputs at all, so its mods are
@@ -1427,7 +1434,7 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
         if not (two_phase and pass_no == 1) or not out_w or not out_h:
             return latent
         cw, ch = _phase_1_canvas(out_w, out_h)
-        return _fit_latent_to_canvas(latent, cw, ch, 100.0, f"{label} RefMod")
+        return _fit_mod_to_phase_1(pipeline_self, latent, cw, ch, 100.0, label, f"{label} RefMod")
 
     def build_pass(pass_no):
         visual, entries = [], []
@@ -1632,6 +1639,147 @@ WINDOW_MODE_DEFAULT = WINDOW_MODE_STILL
 
 
 _VAE_SPATIAL_FACTOR = 16   # pixels per latent cell, both axes
+
+
+# ── How a mod is fitted to phase 1's canvas ───────────────────────────────
+#
+# Two choices, both from the Refmod-Fork, both only ever relevant on a
+# two-phase run (phase 2 and single-phase runs get the full canvas and are
+# left alone):
+#
+# "Shrink method". _fit_latent_to_canvas averages VAE latent cells, which is
+# not the same operation as shrinking the picture: it blurs fine detail, and
+# a face is the first thing to go. Re-encoding instead -- decode the mod,
+# resize the *pixels*, encode again with the generation's own VAE -- gives
+# the same latent size from a properly resampled picture. It costs one VAE
+# round trip per mod and size, cached, and is the default.
+#
+# "Mods in phase 1", the default. Not shrinking at all. Phase 1 is where a
+# two-phase run settles identity (phase 2 restarts from
+# H3_PHASE_2_NOISE_LEVEL_START, 0.9035, and only refines), so a mod that
+# arrives there soft has little left to give. It does cost several times the
+# reference tokens -- 9x for a 90x160 mod at a 1280x1280 output, 16x at
+# 1280x720 -- but those are a small share of a sequence whose target video
+# alone runs to tens of thousands of rows, and it does not show up as a
+# measurable slowdown in practice. Fit is there for when it does.
+SHRINK_REENCODE, SHRINK_FAST = "reencode", "fast"
+SHRINK_DEFAULT = SHRINK_REENCODE
+PHASE1_FIT, PHASE1_FULL = "fit", "full"
+PHASE1_DEFAULT = PHASE1_FULL
+
+# Re-encoded copies, keyed by (mod latent identity, kind, target size), so the
+# VAE round trip happens once per mod and size rather than once per reference
+# per generation. Latents only -- never a pipeline (see _ACTIVE).
+_SHRINK_CACHE = collections.OrderedDict()
+_SHRINK_CACHE_MAX = 16
+
+
+def _cache_put(cache, key, value, limit):
+    cache[key] = value
+    while len(cache) > limit:
+        cache.popitem(last=False)
+    return value
+
+
+def _state_option(state_json, key, default, allowed=None):
+    """One option out of the panel's serialized selection, validated against
+    ``allowed``. Anything missing, unparseable or unknown falls back to the
+    default, so an older saved selection keeps working unchanged."""
+    try:
+        value = json.loads(state_json).get(key, default) if state_json else default
+    except Exception:
+        return default
+    if allowed is not None:
+        value = str(value or default).lower()
+        return value if value in allowed else default
+    return value
+
+
+def _decode_cthw(pipeline_self, latent):
+    """VAE-decode a visual latent to [C, T, H, W] float in [-1, 1], on the CPU."""
+    decoded = pipeline_self.vae.decode(latent.to(device=pipeline_self.device, dtype=torch.float32))
+    return decoded.float().clamp(-1.0, 1.0)[0].cpu()
+
+
+def _reencode_smaller(pipeline_self, latent, kind, width, height):
+    """Decode, resize the pixels to (width, height), encode again. Returns
+    None on any failure, so the caller can fall back to the latent resample.
+
+    Picture mods are rebuilt one latent frame at a time: a stack of stills was
+    encoded as separate pictures, and decoding it as a clip would smear them
+    into each other."""
+    try:
+        from models.minimax_h3 import pipeline as h3_pipeline
+        key = (tuple(latent.shape), round(float(latent.float().sum()), 3), kind, int(width), int(height))
+        hit = _SHRINK_CACHE.get(key)
+        if hit is not None:
+            _SHRINK_CACHE.move_to_end(key)
+            return hit
+        if kind == "image":
+            parts = []
+            for j in range(latent.shape[2]):
+                picture = _decode_cthw(pipeline_self, latent[:, :, j:j + 1])[:, :1]
+                parts.append(pipeline_self._encode_video(
+                    h3_pipeline._resize_video(picture, int(height), int(width))))
+            smaller = torch.cat(parts, dim=2)
+        else:
+            video = _decode_cthw(pipeline_self, latent)
+            smaller = pipeline_self._encode_video(h3_pipeline._resize_video(video, int(height), int(width)))
+        return _cache_put(_SHRINK_CACHE, key, smaller.to(latent.dtype), _SHRINK_CACHE_MAX)
+    except Exception:
+        _log("could not re-encode a RefMod at the smaller size, falling back to the latent "
+             "resample for this one:\n" + traceback.format_exc())
+        return None
+
+
+def _fit_mod_to_phase_1(pipeline_self, latent, target_width, target_height,
+                        relative_size=100.0, kind="image", label=""):
+    """The single entry point for phase-1 fitting. Honours "Mods in phase 1"
+    (full size = leave it alone) and "Shrink method" (re-encode vs resample)."""
+    state = _gen_state(pipeline_self)
+    if state.get("phase1_mods", PHASE1_DEFAULT) == PHASE1_FULL:
+        if not state.get("_p1_full_logged"):
+            state["_p1_full_logged"] = True
+            _log("Mods in phase 1: Full size -- mods are not shrunk to phase 1's half canvas "
+                 "(sharper, and several times more reference tokens in phase 1)")
+        return latent
+    if state.get("shrink_method", SHRINK_DEFAULT) == SHRINK_FAST:
+        return _fit_latent_to_canvas(latent, target_width, target_height, relative_size, label)
+    if latent is None or latent.dim() != 5:
+        return latent
+    target = _fit_target_cells(latent, target_width, target_height, relative_size)
+    if target is None:
+        return latent
+    new_h, new_w = target
+    smaller = _reencode_smaller(pipeline_self, latent, kind,
+                                new_w * _VAE_SPATIAL_FACTOR, new_h * _VAE_SPATIAL_FACTOR)
+    if smaller is None:
+        return _fit_latent_to_canvas(latent, target_width, target_height, relative_size, label)
+    _log(f"fitted {label or 'RefMod'} to this phase's canvas (re-encoded): "
+         f"{latent.shape[-1]}x{latent.shape[-2]} -> {smaller.shape[-1]}x{smaller.shape[-2]} latent cells")
+    return smaller
+
+
+def _fit_target_cells(latent, target_width, target_height, relative_size=100.0):
+    """(new_h, new_w) in latent cells for this canvas, or None to leave the
+    latent as it is. Same arithmetic _fit_latent_to_canvas uses, so the two
+    shrink methods always land on the same size -- only the resampling
+    differs. Keeps the aspect ratio, keeps both axes even for the DiT's 2x2
+    patching, and never enlarges."""
+    h, w = latent.shape[-2], latent.shape[-1]
+    try:
+        budget = float(target_width) * float(target_height) * float(relative_size) / 100.0
+    except (TypeError, ValueError):
+        return None
+    current = (h * _VAE_SPATIAL_FACTOR) * (w * _VAE_SPATIAL_FACTOR)
+    if budget <= 0 or current <= budget:
+        return None
+    scale = (budget / current) ** 0.5
+    new_h = max(2, int(round(h * scale / 2)) * 2)
+    new_w = max(2, int(round(w * scale / 2)) * 2)
+    if new_h >= h and new_w >= w:
+        return None
+    return min(new_h, h), min(new_w, w)
 
 
 def _should_fit(pipeline_self, target_width, target_height) -> bool:
