@@ -120,8 +120,24 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 # Both can be turned off without editing code, for isolating a problem:
 #   set H3REFMOD_FL2VA=0        -> mods only work on Ref2VA, as before v0.39
 #   set H3REFMOD_CONTROLNET=0   -> FL2VA yes, the ControlNet model no
+#   set H3REFMOD_P_H3_IMAGE=0   -> no mods on P-H3-Image
 FL2VA_REFMODS = os.environ.get("H3REFMOD_FL2VA", "1").strip() not in ("0", "false", "off")
 CONTROLNET_REFMODS = os.environ.get("H3REFMOD_CONTROLNET", "1").strip() not in ("0", "false", "off")
+
+# P-H3-Image ("P-H3-Image 8-Step 20B", by Pruna AI): still images and edits on
+# MiniMax H3's FL2VA transformer, with a Qwen3-VL-4B text encoder and a
+# single-frame VAE *decoder*. Despite the name it is built with
+# reference_mode=True (minimax_h3_handler.py), so mods take the ordinary
+# Ref2VA route here -- not the FL2VA one, which exists precisely for models
+# that have no reference inputs.
+#
+# Its VAE is a different checkpoint, but the same MiniMaxH3VideoVAE class and
+# the same LATENTS_MEAN / LATENTS_STD: single_frame only sets
+# decoder_patch_size_t, which the *encoder* never sees. So a mod extracted on
+# a video H3 model is in the same latent space as one extracted here.
+P_H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
+P_H3_IMAGE_REFMODS = os.environ.get("H3REFMOD_P_H3_IMAGE", "1").strip() not in ("0", "false", "off")
+
 
 # Architecture prefixes, from models/minimax_h3/minimax_h3_handler.py:
 # FL2VA_ARCHITECTURE / FL2VA_PRUNED_ARCHITECTURE = "minimax_h3_fl2va[_pruned]",
@@ -130,23 +146,29 @@ def _fl2va_family_prefixes():
     return ("minimax_h3_fl2va",) + (("minimax_h3_control",) if CONTROLNET_REFMODS else ())
 
 
+def _refmod_capable_prefixes():
+    return ((_fl2va_family_prefixes() if FL2VA_REFMODS else ())
+            + ((P_H3_IMAGE_ARCHITECTURE,) if P_H3_IMAGE_REFMODS else ()))
+
+
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
-    """Models RefMods can be used with: Ref2VA, plus FL2VA, its finetunes and
-    the FL2VA ControlNet model. Resolves finetunes to their real architecture
-    exactly as is_minimax_h3_ref2va does."""
+    """Models RefMods can be used with: Ref2VA, plus FL2VA, its finetunes, the
+    FL2VA ControlNet model and P-H3-Image. Resolves finetunes to their real
+    architecture exactly as is_minimax_h3_ref2va does."""
     if is_minimax_h3_ref2va(model_type, get_base_model_type_fn):
         return True
     model_type = str(model_type or "")
-    if not FL2VA_REFMODS or not model_type:
+    prefixes = _refmod_capable_prefixes()
+    if not prefixes or not model_type:
         return False
     if callable(get_base_model_type_fn):
         try:
             base = get_base_model_type_fn(model_type)
             if base:
-                return str(base).startswith(_fl2va_family_prefixes())
+                return str(base).startswith(prefixes)
         except Exception:
             pass
-    return model_type.startswith(_fl2va_family_prefixes())
+    return model_type.startswith(prefixes)
 
 
 class _RefModImageSentinel:
@@ -1067,6 +1089,20 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # Generation-time injection
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _is_image_model(pipeline_self) -> bool:
+    """True for P-H3-Image: a single still, no video and no audio. WanGP forces
+    image_mode to 1 for any model whose definition says image_outputs, but the
+    pipeline's own flag is the thing that is always right, so both count."""
+    return bool(getattr(pipeline_self, "image_model", False))
+
+
+def _has_audio_vae(pipeline_self) -> bool:
+    """P-H3-Image is built with audio_vae=None (minimax_h3_main.model_factory),
+    so _encode_audio would raise AttributeError on it. Ask the pipeline rather
+    than the model name, which a finetune can change."""
+    return getattr(pipeline_self, "audio_vae", None) is not None
+
+
 def _build_refmod_sentinels(pipeline_self, state_json, window_no, image_output):
     """Parse a saved selection and turn it into sentinels, ready to be placed.
 
@@ -1194,6 +1230,14 @@ def _build_refmod_sentinels(pipeline_self, state_json, window_no, image_output):
     # here, that same code would keep the first one and silently drop any
     # others. Convert them ourselves instead -- one still reference per mod,
     # from its first latent frame, exactly what the image path can use.
+    if audio_sentinels and not _has_audio_vae(pipeline_self):
+        _log(f"this model has no audio VAE (P-H3-Image generates a still image, nothing else), so "
+             f"{len(audio_sentinels)} audio-kind RefMod(s) are skipped -- they would crash the "
+             f"generation. Image and video mods are unaffected.")
+        audio_sentinels = []
+        if not image_sentinels and not video_sentinels:
+            return None
+
     if image_output and video_sentinels:
         for sentinel in video_sentinels:
             still = _RefModImageSentinel(sentinel.latent[:, :, :1])
@@ -1212,7 +1256,7 @@ def _inject_refmods(pipeline_self, kwargs: dict, state_json: str) -> dict:
     window_no = kwargs.get("window_no")
     built = _build_refmod_sentinels(
         pipeline_self, state_json, window_no,
-        image_output=(int(kwargs.get("image_mode") or 0) > 0
+        image_output=((int(kwargs.get("image_mode") or 0) > 0 or _is_image_model(pipeline_self))
                       and not getattr(pipeline_self, "audio_only", False)))
     if built is None:
         return kwargs
@@ -1418,7 +1462,7 @@ def _stage_fl2va_refmods(pipeline_self, kwargs, state_json) -> bool:
     entries are built in exactly the order their latents get appended."""
     built = _build_refmod_sentinels(
         pipeline_self, state_json, kwargs.get("window_no"),
-        image_output=(int(kwargs.get("image_mode") or 0) > 0
+        image_output=((int(kwargs.get("image_mode") or 0) > 0 or _is_image_model(pipeline_self))
                       and not getattr(pipeline_self, "audio_only", False)))
     if built is None:
         return False
@@ -1951,6 +1995,11 @@ def _run_extract_audio_job(pipeline_self, spec: dict, status) -> None:
 
     if not audio_path:
         raise ValueError("RefMod extraction: no reference audio provided.")
+    if not _has_audio_vae(pipeline_self):
+        raise ValueError(
+            "RefMod extraction: this model has no audio VAE, so it cannot encode an audio mod. "
+            "P-H3-Image generates still images only -- pick a MiniMax H3 Ref2VA or FL2VA model "
+            "above to extract an audio mod (the mod will still be usable wherever audio is).")
 
     # The Extract UI's "duration to use (seconds)" slider always talks to this
     # function in terms of the shared "latent_frames" spec key (same one

@@ -1,8 +1,8 @@
 {
   "name": "MiniMax H3 RefMods",
   "author": "ported for Wan2GP by community, original concept by Luisa (luisacaotica/ComfyUI-MiniMaxH3Mod)",
-  "version": "0.42.0",
-  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA, FL2VA and FL2VA ControlNet: compress an image/video/audio reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation.",
+  "version": "0.43.0",
+  "description": "No-training 'reference mods' for MiniMax H3 Ref2VA, FL2VA, FL2VA ControlNet and P-H3-Image: compress an image/video/audio reference into a small .safetensors file once, then reuse it at any strength without re-encoding it every generation.",
   "type": [
     "app"
   ],

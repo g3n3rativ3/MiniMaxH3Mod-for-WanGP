@@ -749,6 +749,38 @@ hold RefMod latents, and those have no reason to survive the generation either.
 reference the way WanGP does when releasing a model, and asserts the pipeline
 is collected, for Ref2VA and FL2VA, single-phase and two-phase.
 
+## P-H3-Image
+
+"P-H3-Image 8-Step 20B" (Pruna AI) makes a single still image, or edits one
+with up to 8 input images, on MiniMax H3's FL2VA transformer with a
+Qwen3-VL-4B text encoder and a single-frame VAE decoder. Mods work on it, and
+it needs no new route: despite having no video at all, it is built with
+`reference_mode=True`, so it takes the ordinary Ref2VA path.
+
+Its VAE is a different checkpoint, but the same `MiniMaxH3VideoVAE` class with
+the same `LATENTS_MEAN` / `LATENTS_STD`. `single_frame` only sets
+`decoder_patch_size_t`, which the **encoder** never sees, so a mod extracted on
+a video H3 model is in the same latent space as one extracted here, and the two
+are interchangeable.
+
+Three things are different and are handled:
+
+- **No audio VAE.** The model is built with `audio_vae=None`, so
+  `_encode_audio` would raise an `AttributeError` mid-generation. Audio mods
+  selected on this model are skipped with a message, and the visual ones go in
+  as usual; an audio-only selection leaves the generation completely untouched.
+  Extracting an audio mod here is refused up front, with a message naming
+  the reason. The check asks the pipeline for its `audio_vae`, not the model
+  name, so a finetune under any name behaves correctly.
+- **A still output.** Video mods become single still references, the same
+  conversion already used for text-to-image, labelled `<Picture N>` rather than
+  `<Video N>`. WanGP forces `image_mode` to 1 for any model declaring
+  `image_outputs`, but the pipeline's own `image_model` flag is checked too.
+- **No second phase.** Its definition locks `guidance_max_phases` to 1, so the
+  phase-1 fitting options never apply here, whatever they are set to.
+
+`H3REFMOD_P_H3_IMAGE=0` turns mods off for this model alone.
+
 ## FL2VA and FL2VA ControlNet
 
 RefMods work on FL2VA, its finetunes (VDN and others) and the FL2VA
