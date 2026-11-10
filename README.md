@@ -749,6 +749,42 @@ hold RefMod latents, and those have no reason to survive the generation either.
 reference the way WanGP does when releasing a model, and asserts the pipeline
 is collected, for Ref2VA and FL2VA, single-phase and two-phase.
 
+## MiniMax-H3-Image
+
+MiniMax's own image model on the H3 architecture: 6 fixed steps, no audio
+stream, a 2D ViT decoder, up to 16 reference images. Architectures
+`minimax_h3_image` and `minimax_h3_image_pruned`, added in WanGP v19.29, which
+in the same release renamed P-H3-Image's architecture to `minimax_p_h3_image`.
+
+Mods work on it and it needs no new route: like P-H3-Image it is built with
+`reference_mode=True`, so it takes the ordinary Ref2VA path.
+
+**The latents are the same.** This is what makes a mod extracted on Ref2VA or
+FL2VA usable here, and it holds for two independent reasons. In WanGP's code,
+`MiniMaxH3VideoVAE` passes the same `LATENTS_MEAN` / `LATENTS_STD` whatever
+decoder it is given, and the `IMAGE_DECODER` preset sets only `decoder_*`
+keys -- the encoder is untouched. And in the released weights, MiniMax froze
+the H3 encoder and fine-tuned only the decoder and `post_quant_conv`, on H3's
+24-channel latent format. So the mod is not merely in a compatible space: it
+is produced by the same encoder.
+
+The same three differences as P-H3-Image apply and are already handled: no
+audio VAE (audio mods skipped with a message, audio extraction refused up
+front), a still output (video mods become single stills labelled
+`<Picture N>`), and no second phase (`guidance_max_phases` locked to 1).
+
+One difference of its own: H3-Image sizes its live references itself -- kept as
+supplied when the short edge is within 1024-2048, otherwise scaled, then
+cropped to whole 32px patches -- and shows the text encoder a 1024px short
+edge. Mods bypass that sizing, because they arrive already encoded; the packer
+takes each reference at its own latent size, so this costs nothing. It does
+mean the plugin's own prompt-view resolution is what the text encoder sees of
+a mod, and its 1024px default happens to match what H3-Image gives a live
+reference.
+
+`H3REFMOD_H3_IMAGE=0` turns mods off for this model alone, independently of
+`H3REFMOD_P_H3_IMAGE`.
+
 ## P-H3-Image
 
 "P-H3-Image 8-Step 20B" (Pruna AI) makes a single still image, or edits one

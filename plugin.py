@@ -423,7 +423,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.43.1"
+        self.version = "0.44.0"
         self.description = ("No-training reference mods for MiniMax H3: compress a reference "
                             "into a small file once, reuse it at any strength without "
                             "re-encoding it every generation.")
@@ -527,7 +527,7 @@ class MiniMaxH3RefModsPlugin(WAN2GPPlugin):
         with gr.Accordion("MiniMax H3 RefMods (inline)", open=False) as accordion:
             gr.Markdown(
                 "Applies to **MiniMax H3 Ref2VA**, **FL2VA** (ControlNet included) and "
-                "**P-H3-Image** -- every other "
+                "**MiniMax-H3-Image** and **P-H3-Image** -- every other "
                 "field on this page (resolution, frame count, steps, attention mode, memory "
                 "profile, output filename, etc.) is untouched and works exactly as normal. "
                 "Extract new RefMods from the **MiniMax H3 RefMods** tab. Selecting a mod here "

@@ -56,6 +56,7 @@ import functools
 import json
 import os
 import random
+import sys
 import traceback
 import weakref
 from typing import Optional
@@ -121,6 +122,7 @@ def is_minimax_h3_ref2va(model_type, get_base_model_type_fn=None) -> bool:
 #   set H3REFMOD_FL2VA=0        -> mods only work on Ref2VA, as before v0.39
 #   set H3REFMOD_CONTROLNET=0   -> FL2VA yes, the ControlNet model no
 #   set H3REFMOD_P_H3_IMAGE=0   -> no mods on P-H3-Image
+#   set H3REFMOD_H3_IMAGE=0     -> no mods on MiniMax-H3-Image
 FL2VA_REFMODS = os.environ.get("H3REFMOD_FL2VA", "1").strip() not in ("0", "false", "off")
 CONTROLNET_REFMODS = os.environ.get("H3REFMOD_CONTROLNET", "1").strip() not in ("0", "false", "off")
 
@@ -137,10 +139,19 @@ CONTROLNET_REFMODS = os.environ.get("H3REFMOD_CONTROLNET", "1").strip() not in (
 # a video H3 model is in the same latent space as one extracted here.
 #
 # WanGP v19.29 renamed P-H3-Image's architecture to "minimax_p_h3_image" and gave
-# "minimax_h3_image" / "minimax_h3_image_pruned" to MiniMax's own H3-Image model
-# (no audio stream, 2D decoder, its own reference sizing), which RefMods do not
-# target. The old name still means P-H3-Image on a WanGP without H3-Image.
+# "minimax_h3_image" / "minimax_h3_image_pruned" to MiniMax's own H3-Image model,
+# which is supported too (see H3_IMAGE_ARCHITECTURE below). The old name still
+# means P-H3-Image on a WanGP without H3-Image.
 def _wangp_has_h3_image() -> bool:
+    """Whether this WanGP ships MiniMax-H3-Image, which is what decides whether
+    the bare name "minimax_h3_image" means it or P-H3-Image.
+
+    sys.modules is checked first and find_spec only as a fallback: find_spec
+    searches the parent package's __path__ on the filesystem, which can fail
+    even when the module is already imported, and a wrong answer here silently
+    moves a model from one kill switch to the other."""
+    if "models.minimax_h3.h3_image" in sys.modules:
+        return True
     try:
         import importlib.util
         return importlib.util.find_spec("models.minimax_h3.h3_image") is not None
@@ -148,8 +159,29 @@ def _wangp_has_h3_image() -> bool:
         return False
 
 
-P_H3_IMAGE_ARCHITECTURE = "minimax_p_h3_image" if _wangp_has_h3_image() else "minimax_h3_image"
+# Both names are claimed unconditionally rather than picking one by probing for
+# the h3_image module: "minimax_p_h3_image" is P-H3-Image on every WanGP that
+# has it and matches nothing on any WanGP that does not, so claiming it costs
+# nothing and does not leave support hanging on an import-time probe.
+P_H3_IMAGE_ARCHITECTURES = ("minimax_p_h3_image", "minimax_h3_image")
+P_H3_IMAGE_ARCHITECTURE = P_H3_IMAGE_ARCHITECTURES[0] if _wangp_has_h3_image() else P_H3_IMAGE_ARCHITECTURES[1]
 P_H3_IMAGE_REFMODS = os.environ.get("H3REFMOD_P_H3_IMAGE", "1").strip() not in ("0", "false", "off")
+
+# MiniMax-H3-Image ("minimax_h3_image", and "..._pruned" through startswith):
+# MiniMax's own image model on the H3 architecture, 6 steps, no audio stream,
+# a 2D ViT decoder, up to 16 reference images. Mods work on it and it needs no
+# new route: like P-H3-Image it is built with reference_mode=True
+# (minimax_h3_handler.py), so it takes the ordinary Ref2VA path.
+#
+# Its VAE is a different checkpoint but the same latent space, which is what
+# makes a mod extracted on a video H3 model usable here: MiniMaxH3VideoVAE
+# passes the same LATENTS_MEAN / LATENTS_STD whatever the decoder, and the
+# image_decoder preset changes decoder keys only -- the *encoder* is untouched.
+# MiniMax say the same of the released weights: the H3 encoder was frozen and
+# only the decoder and post_quant_conv were fine-tuned, on H3's 24-channel
+# latent format.
+H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
+H3_IMAGE_REFMODS = os.environ.get("H3REFMOD_H3_IMAGE", "1").strip() not in ("0", "false", "off")
 
 
 # Architecture prefixes, from models/minimax_h3/minimax_h3_handler.py:
@@ -160,8 +192,21 @@ def _fl2va_family_prefixes():
 
 
 def _refmod_capable_prefixes():
-    return ((_fl2va_family_prefixes() if FL2VA_REFMODS else ())
-            + ((P_H3_IMAGE_ARCHITECTURE,) if P_H3_IMAGE_REFMODS else ()))
+    # On a WanGP without H3-Image, P_H3_IMAGE_ARCHITECTURE and
+    # H3_IMAGE_ARCHITECTURE are the same string and both mean P-H3-Image; the
+    # duplicate is harmless. "minimax_h3_image" never matches
+    # "minimax_p_h3_image", so the two stay distinct on a WanGP that has both.
+    prefixes = _fl2va_family_prefixes() if FL2VA_REFMODS else ()
+    if P_H3_IMAGE_REFMODS:
+        # On a WanGP that has H3-Image, only the first name is P-H3-Image; on an
+        # older one, only the second exists and means P-H3-Image. Claiming the
+        # bare name here would also claim H3-Image, so it is added only when
+        # this WanGP has no H3-Image to confuse it with.
+        prefixes += ((P_H3_IMAGE_ARCHITECTURES[0],) if _wangp_has_h3_image()
+                     else P_H3_IMAGE_ARCHITECTURES)
+    if H3_IMAGE_REFMODS:
+        prefixes += (H3_IMAGE_ARCHITECTURE,)
+    return prefixes
 
 
 def is_minimax_h3_refmod_capable(model_type, get_base_model_type_fn=None) -> bool:
