@@ -135,7 +135,20 @@ CONTROLNET_REFMODS = os.environ.get("H3REFMOD_CONTROLNET", "1").strip() not in (
 # the same LATENTS_MEAN / LATENTS_STD: single_frame only sets
 # decoder_patch_size_t, which the *encoder* never sees. So a mod extracted on
 # a video H3 model is in the same latent space as one extracted here.
-P_H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
+#
+# WanGP v19.29 renamed P-H3-Image's architecture to "minimax_p_h3_image" and gave
+# "minimax_h3_image" / "minimax_h3_image_pruned" to MiniMax's own H3-Image model
+# (no audio stream, 2D decoder, its own reference sizing), which RefMods do not
+# target. The old name still means P-H3-Image on a WanGP without H3-Image.
+def _wangp_has_h3_image() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("models.minimax_h3.h3_image") is not None
+    except Exception:
+        return False
+
+
+P_H3_IMAGE_ARCHITECTURE = "minimax_p_h3_image" if _wangp_has_h3_image() else "minimax_h3_image"
 P_H3_IMAGE_REFMODS = os.environ.get("H3REFMOD_P_H3_IMAGE", "1").strip() not in ("0", "false", "off")
 
 
@@ -649,7 +662,8 @@ def install_patches() -> Optional[str]:
 
     @functools.wraps(_orig_add_image_reference)
     def patched_add_image_reference(self, image, target_width, target_height,
-                                     image_refs_relative_size, presentation, visual_latents, refs):
+                                     image_refs_relative_size, presentation, visual_latents, refs,
+                                     *args, **kwargs):
         if isinstance(image, _RefModImageSentinel):
             latent = (_fit_mod_to_phase_1(self, image.latent, target_width, target_height,
                                           image_refs_relative_size, "image", "image RefMod")
@@ -684,10 +698,14 @@ def install_patches() -> Optional[str]:
             return
         _note_refs(self, refs)
         return _orig_add_image_reference(self, image, target_width, target_height,
-                                          image_refs_relative_size, presentation, visual_latents, refs)
+                                          image_refs_relative_size, presentation, visual_latents, refs,
+                                          *args, **kwargs)
 
     @functools.wraps(_orig_add_video_reference)
-    def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+    def patched_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs,
+                                    *args, **kwargs):
+        # WanGP v19.29 added latent= (Regenerate 2K IC: the phase-1 draft, already encoded, as phase 2's reference
+        # video); it and any argument added later go through to WanGP unchanged.
         if isinstance(video, _RefModImageSentinel):
             # Symmetric guard: a still RefMod on the video path is simply a
             # one-frame clip, which is a valid video latent.
@@ -707,7 +725,8 @@ def install_patches() -> Optional[str]:
                                "latent_h": latent.shape[-2], "latent_w": latent.shape[-1], "ref_audio_t": 0})
             return
         _note_refs(self, refs)
-        return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs)
+        return _orig_add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs,
+                                         *args, **kwargs)
 
     if _orig_add_audio_reference is not None and _orig_load_audio_reference is not None:
         @functools.wraps(_orig_load_audio_reference)
@@ -1090,9 +1109,11 @@ def install_get_model_settings_patch(orig_get_model_settings, set_global_fn,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_image_model(pipeline_self) -> bool:
-    """True for P-H3-Image: a single still, no video and no audio. WanGP forces
-    image_mode to 1 for any model whose definition says image_outputs, but the
-    pipeline's own flag is the thing that is always right, so both count."""
+    """True for P-H3-Image (and H3-Image): a single still, no video and no audio.
+    WanGP forces image_mode to 1 for any model whose definition says
+    image_outputs, but the pipeline's own flag is the thing that is always
+    right, so both count. Since WanGP v19.29 the flag is None, "p_h3_image" or
+    "h3_image" instead of a bool: truthiness still holds."""
     return bool(getattr(pipeline_self, "image_model", False))
 
 

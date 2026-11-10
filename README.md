@@ -781,6 +781,12 @@ Three things are different and are handled:
 
 `H3REFMOD_P_H3_IMAGE=0` turns mods off for this model alone.
 
+WanGP v19.29 moved P-H3-Image to the architecture `minimax_p_h3_image` and gave
+`minimax_h3_image` / `minimax_h3_image_pruned` to MiniMax's own **H3-Image**
+model. Since v0.43.1 the plugin follows the rename (the old name is still used on a
+WanGP without H3-Image); RefMods are not offered on H3-Image itself, which sizes
+and labels its references its own way and has not been tested with mods.
+
 ## FL2VA and FL2VA ControlNet
 
 RefMods work on FL2VA, its finetunes (VDN and others) and the FL2VA
